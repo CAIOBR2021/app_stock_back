@@ -10,17 +10,36 @@ const { sendLowStockEmail } = require('./services/emailService');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Middlewares
-app.use(cors());
+// --- MELHORIA 1: CORS SEGURO ---
+// Define quem pode acessar sua API
+const allowedOrigins = [
+  'http://localhost:5173',           // Seu ambiente local (Vite)
+  'http://localhost:3000',           // Caso use Create React App
+  'https://app-stock-rho.vercel.app' // Seu Frontend na Vercel
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permite requisições sem 'origin' (ex: Postman ou mobile apps) ou se estiver na lista
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Acesso bloqueado por CORS'));
+    }
+  }
+}));
+
 app.use(express.json());
 
-// --- BANCO DE DADOS (PostgreSQL) ---
+// --- MELHORIA 2: POOL OTIMIZADO ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === 'production'
-      ? { rejectUnauthorized: false }
-      : false,
+  ssl: process.env.NODE_ENV === 'production'
+    ? { rejectUnauthorized: false }
+    : false,
+  max: 10, // Limita conexões simultâneas (ideal para Render Free Tier)
+  idleTimeoutMillis: 30000, // Fecha conexões ociosas após 30s
+  connectionTimeoutMillis: 2000, // Timeout para tentar conectar
 });
 
 pool
@@ -65,7 +84,6 @@ async function setupDatabase() {
       FOREIGN KEY (produtoid) REFERENCES produtos (id) ON DELETE CASCADE
     );
 
-    -- NOVA TABELA: ENTREGAS (LOGÍSTICA)
     CREATE TABLE IF NOT EXISTS entregas (
       id UUID PRIMARY KEY,
       data_hora_solicitacao TIMESTAMPTZ NOT NULL,
@@ -459,14 +477,54 @@ app.post('/api/entregas', async (req, res) => {
   }
 });
 
-// Deletar entrega
+// --- MELHORIA 3: DELETAR ENTREGA COM ESTORNO ---
 app.delete('/api/entregas/:id', async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect(); // Inicia conexão exclusiva para transação
+
   try {
-    await pool.query('DELETE FROM entregas WHERE id = $1', [id]);
-    res.json({ message: 'Entrega excluída.' });
+    await client.query('BEGIN'); // Começa transação
+
+    // 1. Busca a entrega para saber quanto estornar
+    const entregaRes = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
+    const entrega = entregaRes.rows[0];
+
+    if (!entrega) {
+       await client.query('ROLLBACK');
+       return res.status(404).json({ error: 'Entrega não encontrada.' });
+    }
+
+    // 2. Busca o Produto e trava o registro (FOR UPDATE)
+    const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [entrega.produto_id]);
+    const produto = prodRes.rows[0];
+
+    // Se o produto ainda existir, fazemos o estorno
+    if (produto) {
+        const qtdEstornar = Number(entrega.item_quantidade);
+        const novoSaldo = Number(produto.quantidade) + qtdEstornar;
+
+        // 3. Atualiza o estoque (Estorno)
+        await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = $2 WHERE id = $3', [novoSaldo, nowISO(), produto.id]);
+
+        // 4. Registra movimentação de entrada (Histórico)
+        const movId = uid();
+        await client.query(
+            'INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem) VALUES ($1, $2, $3, $4, $5, $6)',
+            [movId, produto.id, 'entrada', qtdEstornar, `Estorno: Exclusão da Entrega p/ ${entrega.local_obra}`, nowISO()]
+        );
+    }
+
+    // 5. Deleta a entrega
+    await client.query('DELETE FROM entregas WHERE id = $1', [id]);
+
+    await client.query('COMMIT'); // Salva tudo
+    res.json({ message: 'Entrega excluída e estoque estornado com sucesso.' });
+
   } catch (err) {
+    await client.query('ROLLBACK'); // Desfaz tudo se der erro
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release(); // Libera conexão
   }
 });
 

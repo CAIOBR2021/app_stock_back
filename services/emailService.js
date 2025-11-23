@@ -10,63 +10,71 @@ const resend = new Resend(process.env.RESEND_API_KEY);
  * @param {object} produto - O objeto do produto (já em camelCase) que está com estoque baixo.
  */
 async function sendLowStockEmail(produto) {
-  // Verificação para garantir que os dados necessários existem
+  // 1. Validação de segurança
   if (
     !produto ||
     typeof produto.estoqueMinimo === 'undefined' ||
     !process.env.EMAIL_RECIPIENTS
   ) {
+    console.warn('Tentativa de envio de email cancelada: Dados do produto ou destinatários ausentes.');
     return;
   }
 
-  console.log(`Tentando enviar notificação para o produto: ${produto.nome}`);
+  // 2. Configuração do Remetente (Usa variável ou fallback para teste)
+  const fromEmail = process.env.EMAIL_FROM || 'Sistema de Estoque <onboarding@resend.dev>';
+
+  console.log(`📧 Preparando envio de alerta para o produto: ${produto.nome}`);
 
   try {
     const { data, error } = await resend.emails.send({
-      from: 'Sistema de Estoque <onboarding@resend.dev>', // Atualize para o seu email verificado no Resend
+      from: fromEmail,
       to: process.env.EMAIL_RECIPIENTS.split(',').map((email) => email.trim()),
-      subject: `⚠️ Alerta de Estoque Baixo: ${produto.nome}`,
+      subject: `⚠️ Alerta: Estoque Baixo - ${produto.nome}`,
       html: `
-        <h1>Alerta de Estoque Baixo</h1>
-        <p>O produto abaixo atingiu ou ficou abaixo do nível mínimo de estoque definido.</p>
-        <table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse;">
-          <tr>
-            <td style="background-color: #f2f2f2;"><strong>SKU</strong></td>
-            <td>${produto.sku}</td>
-          </tr>
-          <tr>
-            <td style="background-color: #f2f2f2;"><strong>Nome</strong></td>
-            <td>${produto.nome}</td>
-          </tr>
-          <tr>
-            <td style="background-color: #f2f2f2;"><strong>Estoque Atual</strong></td>
-            <td style="color: red; font-weight: bold;">${produto.quantidade} ${produto.unidade}</td>
-          </tr>
-          <tr>
-            <td style="background-color: #f2f2f2;"><strong>Estoque Mínimo</strong></td>
-            <td>${produto.estoqueMinimo} ${produto.unidade}</td>
-          </tr>
-        </table>
-        <p>Por favor, providencie a reposição do item o mais rápido possível.</p>
+        <div style="font-family: Arial, sans-serif; color: #333;">
+          <h2 style="color: #d9534f;">Alerta de Reposição Necessária</h2>
+          <p>O sistema detectou que o seguinte item atingiu o nível crítico de estoque após uma movimentação recente.</p>
+          
+          <table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse; width: 100%; max-width: 600px; border-color: #ddd;">
+            <tr style="background-color: #f8f9fa;">
+              <td width="30%"><strong>SKU</strong></td>
+              <td>${produto.sku || '-'}</td>
+            </tr>
+            <tr>
+              <td><strong>Produto</strong></td>
+              <td style="font-size: 16px; font-weight: bold;">${produto.nome}</td>
+            </tr>
+            <tr>
+              <td><strong>Estoque Atual</strong></td>
+              <td style="color: #d9534f; font-weight: bold; font-size: 18px;">
+                ${Number(produto.quantidade).toLocaleString('pt-BR')} ${produto.unidade}
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Mínimo Definido</strong></td>
+              <td>
+                ${Number(produto.estoqueMinimo).toLocaleString('pt-BR')} ${produto.unidade}
+              </td>
+            </tr>
+          </table>
+
+          <p style="margin-top: 20px; font-size: 12px; color: #777;">
+            Este é um e-mail automático gerado pelo Sistema Integrado.
+            <br>Data do alerta: ${new Date().toLocaleString('pt-BR')}
+          </p>
+        </div>
       `,
     });
 
     if (error) {
-      console.error(
-        `ERRO ao enviar e-mail de notificação para ${produto.nome}:`,
-        error,
-      );
+      console.error(`❌ ERRO API Resend ao enviar para ${produto.nome}:`, error);
       return;
     }
 
-    console.log(
-      `E-mail de alerta enviado com sucesso para ${produto.nome}. ID: ${data.id}`,
-    );
-  } catch (error) {
-    console.error(
-      `ERRO ao enviar e-mail de notificação para ${produto.nome}:`,
-      error,
-    );
+    console.log(`✅ Email enviado! ID: ${data.id} | Produto: ${produto.nome}`);
+
+  } catch (err) {
+    console.error(`❌ ERRO CRÍTICO no serviço de email (${produto.nome}):`, err);
   }
 }
 
