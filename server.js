@@ -359,7 +359,6 @@ app.post('/api/entregas', async (req, res) => {
 });
 
 // Atualizar Entrega (Reprogramar Data/Hora/Local etc)
-// (CORREÇÃO: Uso de COALESCE com fallback NULL para suportar atualizações parciais)
 app.put('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const { dataHoraSolicitacao, localArmazenagem, localObra, responsavelNome, responsavelTelefone, status } = req.body;
@@ -400,11 +399,47 @@ app.patch('/api/entregas/:id/status', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Excluir Entrega (COM ESTORNO AUTOMÁTICO)
 app.delete('/api/entregas/:id', async (req, res) => {
+    const { id } = req.params;
+    const client = await pool.connect();
+    
     try {
-        await pool.query('DELETE FROM entregas WHERE id = $1', [req.params.id]);
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        await client.query('BEGIN');
+
+        // 1. Buscar dados da entrega antes de excluir para saber o que devolver
+        const resEntrega = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
+        if (resEntrega.rowCount === 0) {
+            throw new Error('Entrega não encontrada.');
+        }
+        const entrega = resEntrega.rows[0];
+
+        // 2. Devolver itens ao estoque (UPDATE produtos)
+        await client.query(
+            'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
+            [entrega.item_quantidade, entrega.produto_id]
+        );
+
+        // 3. Registrar movimentação de estorno (Cria uma 'entrada' no histórico)
+        const motivoEstorno = `Estorno: Entrega excluída (Obra: ${entrega.local_obra})`;
+        await client.query(
+            `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem)
+             VALUES ($1, $2, 'entrada', $3, $4, NOW())`,
+            [uid(), entrega.produto_id, entrega.item_quantidade, motivoEstorno]
+        );
+
+        // 4. Finalmente, excluir a entrega
+        await client.query('DELETE FROM entregas WHERE id = $1', [id]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'Entrega excluída e estoque estornado.' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Erro ao excluir entrega:', err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
 });
 
 app.listen(PORT, () => {
