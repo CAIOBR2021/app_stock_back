@@ -43,16 +43,6 @@ async function setupDatabase() {
       valorunitario NUMERIC(10, 2)
     );
 
-    CREATE TABLE IF NOT EXISTS movimentacoes (
-      id UUID PRIMARY KEY,
-      produtoid UUID NOT NULL,
-      tipo TEXT NOT NULL,
-      quantidade INTEGER NOT NULL,
-      motivo TEXT,
-      criadoem TIMESTAMPTZ NOT NULL,
-      FOREIGN KEY (produtoid) REFERENCES produtos (id) ON DELETE CASCADE
-    );
-
     CREATE TABLE IF NOT EXISTS entregas (
       id UUID PRIMARY KEY,
       data_hora_solicitacao TIMESTAMPTZ NOT NULL,
@@ -67,14 +57,44 @@ async function setupDatabase() {
       criado_em TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (produto_id) REFERENCES produtos (id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS movimentacoes (
+      id UUID PRIMARY KEY,
+      produtoid UUID NOT NULL,
+      tipo TEXT NOT NULL,
+      quantidade INTEGER NOT NULL,
+      motivo TEXT,
+      criadoem TIMESTAMPTZ NOT NULL,
+      entrega_id UUID, -- Nova coluna para vincular
+      FOREIGN KEY (produtoid) REFERENCES produtos (id) ON DELETE CASCADE,
+      FOREIGN KEY (entrega_id) REFERENCES entregas (id) ON DELETE CASCADE
+    );
   `;
   
   try {
     await pool.query(createTables);
     console.log('Tabelas verificadas/criadas com sucesso.');
+    await updateSchema(); // Garante que a coluna exista em bancos já criados
   } catch (err) {
     console.error('Erro ao configurar banco:', err);
   }
+}
+
+// Função para atualizar o schema existente (Adiciona coluna entrega_id se não existir)
+async function updateSchema() {
+    try {
+        await pool.query(`
+            DO $$ 
+            BEGIN 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='entrega_id') THEN 
+                    ALTER TABLE movimentacoes ADD COLUMN entrega_id UUID REFERENCES entregas(id) ON DELETE CASCADE; 
+                END IF; 
+            END $$;
+        `);
+        console.log('Schema atualizado (coluna entrega_id verificada).');
+    } catch (err) {
+        console.error('Erro ao atualizar schema:', err.message);
+    }
 }
 
 // --- UTILITÁRIOS ---
@@ -97,12 +117,13 @@ function toCamelCase(obj) {
     else if (key === 'valorunitario') camelKey = 'valorUnitario';
     else if (key === 'produto_id') camelKey = 'produtoId';
     else if (key === 'data_hora_solicitacao') camelKey = 'dataHoraSolicitacao';
-    else if (key === 'local_armazenagem') camelKey = 'localArmazenamento'; // Padronizando para localArmazenamento
+    else if (key === 'local_armazenagem') camelKey = 'localArmazenamento';
     else if (key === 'local_obra') camelKey = 'localObra';
     else if (key === 'item_quantidade') camelKey = 'itemQuantidade';
     else if (key === 'item_unidade_medida') camelKey = 'itemUnidadeMedida';
     else if (key === 'responsavel_nome') camelKey = 'responsavelNome';
     else if (key === 'responsavel_telefone') camelKey = 'responsavelTelefone';
+    else if (key === 'entrega_id') camelKey = 'entregaId';
     
     newObj[camelKey] = obj[key];
   }
@@ -254,6 +275,7 @@ app.post('/api/movimentacoes', async (req, res) => {
     }
 });
 
+// ALTERAÇÃO IMPORTANTE: Exclusão de movimentação exclui entrega vinculada
 app.delete('/api/movimentacoes/:id', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -265,9 +287,20 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
     const mov = movResult.rows[0];
     if (mov.tipo === 'ajuste') throw new Error('Não é possível excluir ajuste.');
 
+    // --- LOGICA DE SINCRONIZAÇÃO BIDIRECIONAL ---
+    // Se a movimentação tem uma entrega vinculada, devemos excluir a entrega também.
+    // Isso deve ser feito ANTES de reverter o saldo para evitar problemas de FK ou lógica.
+    // Mas, observe: ao excluir a entrega, não queremos acionar a lógica de "Estorno de Entrega" (que cria nova movimentação).
+    // Queremos apenas apagar o registro da entrega, pois o saldo será corrigido aqui na movimentação.
+    if (mov.entrega_id) {
+        await client.query('DELETE FROM entregas WHERE id = $1', [mov.entrega_id]);
+    }
+    // ---------------------------------------------
+
     const prodResult = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [mov.produtoid]);
     const produto = prodResult.rows[0];
     
+    // Reverte o saldo (Desfaz o impacto da movimentação)
     let novaQtd = produto.quantidade + (mov.tipo === 'saida' ? mov.quantidade : -mov.quantidade);
     novaQtd = Math.max(0, novaQtd);
 
@@ -383,7 +416,7 @@ app.get('/api/entregas', async (req, res) => {
   }
 });
 
-// 2. CRIAR ENTREGA (COM BAIXA NO ESTOQUE E REGISTRO DE MOVIMENTAÇÃO)
+// 2. CRIAR ENTREGA (ALTERADO: VINCULAÇÃO COM ENTREGA_ID NA MOVIMENTAÇÃO)
 app.post('/api/entregas', async (req, res) => {
   const { 
     dataHoraSolicitacao, 
@@ -395,7 +428,6 @@ app.post('/api/entregas', async (req, res) => {
     responsavelTelefone 
   } = req.body;
 
-  // Use Number() ou parseFloat() para aceitar decimais se necessário, ou parseInt para inteiros
   const quantidadeNum = Number(itemQuantidade);
 
   if (isNaN(quantidadeNum) || quantidadeNum <= 0) {
@@ -423,11 +455,11 @@ app.post('/api/entregas', async (req, res) => {
     const novoSaldo = produto.quantidade - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
-    // Registra movimento
+    // Registra movimento COM O VÍNCULO (entrega_id)
     await client.query(
-      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem)
-       VALUES ($1, $2, 'saida', $3, $4, NOW())`,
-      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`]
+      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, entrega_id)
+       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5)`,
+      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`, entregaId]
     );
 
     if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
@@ -444,7 +476,7 @@ app.post('/api/entregas', async (req, res) => {
   }
 });
 
-// 3. ATUALIZAR ENTREGA (REPROGRAMAR, ETC)
+// 3. ATUALIZAR ENTREGA
 app.put('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const { dataHoraSolicitacao, localArmazenagem, localObra, responsavelNome, responsavelTelefone, status } = req.body;
@@ -486,7 +518,7 @@ app.patch('/api/entregas/:id/status', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. EXCLUIR ENTREGA (COM ESTORNO AUTOMÁTICO)
+// 5. EXCLUIR ENTREGA (COM ESTORNO AUTOMÁTICO - ALTERADO PARA REMOVER MOVIMENTAÇÃO VINCULADA)
 app.delete('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
@@ -508,7 +540,14 @@ app.delete('/api/entregas/:id', async (req, res) => {
             [quantidadeEstorno, entrega.produto_id]
         );
 
-        // 3. Registrar movimentação de estorno (Cria uma 'entrada' no histórico)
+        // 3. (OPCIONAL/ALTERADO) Ao excluir a entrega, podemos querer limpar a movimentação original de SAÍDA também?
+        // No seu modelo original, você criava uma "Entrada" (Estorno) e mantinha a "Saída" original para histórico.
+        // Se quisermos manter o padrão "Desfazer completamente", podemos apagar a movimentação de saída vinculada.
+        // Caso contrário, mantemos o registro de que saiu e depois voltou (Estorno).
+        // VOU MANTER O SEU PADRÃO ORIGINAL AQUI (CRIA ESTORNO), pois é mais seguro para auditoria.
+        // Se você quisesse apagar tudo como se nunca tivesse existido, descomente a linha abaixo:
+        // await client.query('DELETE FROM movimentacoes WHERE entrega_id = $1', [id]);
+
         const motivoEstorno = `Estorno: Entrega excluída (Obra: ${entrega.local_obra})`;
         await client.query(
             `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem)
@@ -530,18 +569,14 @@ app.delete('/api/entregas/:id', async (req, res) => {
     }
 });
 
-// Rota para buscar apenas a lista de produtos para o 'autocomplete'
-app.get('/api/produtos-lista', (req, res) => {
-    // Ajuste 'codigo' e 'produto' para os nomes reais das suas colunas na tabela 'estoque'
-    const query = "SELECT codigo, produto FROM estoque"; 
-    
-    db.all(query, [], (err, rows) => {
-        if (err) {
-            res.status(400).json({ error: err.message });
-            return;
-        }
+// Rota para buscar apenas a lista de produtos para o 'autocomplete' (exemplo legado, ajustado)
+app.get('/api/produtos-lista', async (req, res) => {
+    try {
+        const { rows } = await pool.query("SELECT id, nome FROM produtos");
         res.json({ message: "success", data: rows });
-    });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, () => {
