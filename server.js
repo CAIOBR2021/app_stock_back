@@ -530,6 +530,20 @@ app.delete('/api/entregas/:id', async (req, res) => {
     }
 });
 
+// Rota para buscar apenas a lista de produtos para o 'autocomplete'
+app.get('/api/produtos-lista', (req, res) => {
+    // Ajuste 'codigo' e 'produto' para os nomes reais das suas colunas na tabela 'estoque'
+    const query = "SELECT codigo, produto FROM estoque"; 
+    
+    db.all(query, [], (err, rows) => {
+        if (err) {
+            res.status(400).json({ error: err.message });
+            return;
+        }
+        res.json({ message: "success", data: rows });
+    });
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
