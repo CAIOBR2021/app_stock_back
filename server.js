@@ -476,37 +476,110 @@ app.post('/api/entregas', async (req, res) => {
   }
 });
 
-// 3. ATUALIZAR ENTREGA
+// 3. ATUALIZAR ENTREGA (COM LOGICA DE ESTOQUE)
 app.put('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
-    const { dataHoraSolicitacao, localArmazenagem, localObra, responsavelNome, responsavelTelefone, status } = req.body;
+    // Extraímos produtoId e itemQuantidade separadamente para lógica de estoque
+    const { 
+        dataHoraSolicitacao, 
+        localArmazenagem, 
+        localObra, 
+        responsavelNome, 
+        responsavelTelefone, 
+        status,
+        produtoId,      // Pode vir na edição
+        itemQuantidade  // Pode vir na edição
+    } = req.body;
+
+    const client = await pool.connect();
     
     try {
-        const { rows } = await pool.query(
+        await client.query('BEGIN');
+
+        // A. Buscar a entrega atual (velha) no banco para saber o que estornar
+        const resAntiga = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
+        if (resAntiga.rowCount === 0) throw new Error('Entrega não encontrada');
+        const entregaAntiga = resAntiga.rows[0];
+
+        // Definir valores novos vs velhos
+        const velhoProdutoId = entregaAntiga.produto_id;
+        const velhaQuantidade = Number(entregaAntiga.item_quantidade);
+
+        // Se o usuário não enviou um novo produto/qtd, mantemos o antigo
+        const novoProdutoId = produtoId || velhoProdutoId;
+        const novaQuantidade = itemQuantidade ? Number(itemQuantidade) : velhaQuantidade;
+
+        // B. Lógica de Estoque (Só executa se houve mudança de produto ou quantidade)
+        if (velhoProdutoId !== novoProdutoId || velhaQuantidade !== novaQuantidade) {
+            
+            // 1. Devolver o estoque antigo para o produto antigo
+            await client.query(
+                'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
+                [velhaQuantidade, velhoProdutoId]
+            );
+
+            // 2. Verificar e Deduzir o estoque do novo produto (pode ser o mesmo ID, mas agora com saldo atualizado)
+            const resProdNovo = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [novoProdutoId]);
+            const prodNovo = resProdNovo.rows[0];
+
+            if (!prodNovo) throw new Error('Novo produto selecionado não encontrado.');
+            
+            // Verifica se tem saldo (considerando que acabamos de devolver a qtd antiga, se for o mesmo produto)
+            if (prodNovo.quantidade < novaQuantidade) {
+                throw new Error(`Estoque insuficiente no produto "${prodNovo.nome}". Disponível: ${prodNovo.quantidade}, Solicitado: ${novaQuantidade}`);
+            }
+
+            // Deduzir a nova quantidade
+            await client.query(
+                'UPDATE produtos SET quantidade = quantidade - $1, atualizadoem = NOW() WHERE id = $2',
+                [novaQuantidade, novoProdutoId]
+            );
+
+            // 3. Atualizar a Movimentação vinculada para manter o histórico coerente
+            // Se existir uma movimentação de SAÍDA vinculada a esta entrega, atualizamos ela.
+            await client.query(
+                `UPDATE movimentacoes 
+                 SET produtoid = $1, quantidade = $2, motivo = $3 
+                 WHERE entrega_id = $4 AND tipo = 'saida'`,
+                [novoProdutoId, novaQuantidade, `Entrega Editada: ${localObra || entregaAntiga.local_obra}`, id]
+            );
+        }
+
+        // C. Atualizar os dados da Entrega em si
+        const { rows } = await client.query(
             `UPDATE entregas 
              SET data_hora_solicitacao = COALESCE($1, data_hora_solicitacao),
                  local_armazenagem = COALESCE($2, local_armazenagem),
                  local_obra = COALESCE($3, local_obra),
                  responsavel_nome = COALESCE($4, responsavel_nome),
                  responsavel_telefone = COALESCE($5, responsavel_telefone),
-                 status = COALESCE($6, status)
-             WHERE id = $7 RETURNING *`,
+                 status = COALESCE($6, status),
+                 produto_id = $7,
+                 item_quantidade = $8,
+                 item_unidade_medida = (SELECT unidade FROM produtos WHERE id = $7) -- Atualiza unidade caso mude o produto
+             WHERE id = $9 RETURNING *`,
             [
                 dataHoraSolicitacao || null, 
                 localArmazenagem || null, 
                 localObra || null, 
                 responsavelNome || null, 
                 responsavelTelefone || null, 
-                status || null, 
+                status || null,
+                novoProdutoId,
+                novaQuantidade,
                 id
             ]
         );
         
-        if (rows.length === 0) return res.status(404).json({ error: 'Entrega não encontrada' });
+        await client.query('COMMIT');
         res.json(toCamelCase(rows[0]));
+
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Erro PUT /entregas:', err);
         res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
 });
 
