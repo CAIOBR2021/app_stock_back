@@ -288,10 +288,6 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
     if (mov.tipo === 'ajuste') throw new Error('Não é possível excluir ajuste.');
 
     // --- LOGICA DE SINCRONIZAÇÃO BIDIRECIONAL ---
-    // Se a movimentação tem uma entrega vinculada, devemos excluir a entrega também.
-    // Isso deve ser feito ANTES de reverter o saldo para evitar problemas de FK ou lógica.
-    // Mas, observe: ao excluir a entrega, não queremos acionar a lógica de "Estorno de Entrega" (que cria nova movimentação).
-    // Queremos apenas apagar o registro da entrega, pois o saldo será corrigido aqui na movimentação.
     if (mov.entrega_id) {
         await client.query('DELETE FROM entregas WHERE id = $1', [mov.entrega_id]);
     }
@@ -317,6 +313,7 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
   }
 });
 
+// --- ROTA DE EDIÇÃO DE MOVIMENTAÇÃO (MODIFICADA) ---
 app.patch('/api/movimentacoes/:id', async (req, res) => {
     const { id } = req.params;
     const { quantidade, motivo } = req.body;
@@ -330,7 +327,7 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
         if (movRes.rowCount === 0) throw new Error('Movimentação não encontrada');
         const movAntiga = movRes.rows[0];
 
-        // Se for ajuste, não permitimos editar quantidade por simplicidade (melhor criar novo ajuste)
+        // Se for ajuste, não permitimos editar quantidade por simplicidade
         if (movAntiga.tipo === 'ajuste') throw new Error('Use um novo Ajuste para corrigir saldo.');
 
         // 2. Busca o produto
@@ -357,9 +354,10 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
 
         if (novoSaldoFinal < 0) throw new Error('Estoque ficaria negativo com essa alteração.');
 
-        // 5. Atualiza o banco
+        // 5. Atualiza o banco (Produtos)
         await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldoFinal, produto.id]);
         
+        // 6. Atualiza a Movimentação
         const updates = [];
         const values = [];
         if (quantidade) {
@@ -374,6 +372,15 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
 
         const movUpdateSql = `UPDATE movimentacoes SET ${updates.join(', ')} WHERE id = $${values.length} RETURNING *`;
         const movUpdatedRes = await client.query(movUpdateSql, values);
+
+        // --- CORREÇÃO AQUI: Atualizar tabela de entregas se houver vínculo ---
+        if (movAntiga.entrega_id && quantidade) {
+            await client.query(
+                'UPDATE entregas SET item_quantidade = $1 WHERE id = $2',
+                [novaQtd, movAntiga.entrega_id]
+            );
+        }
+        // -------------------------------------------------------------------
 
         await client.query('COMMIT');
 
@@ -416,7 +423,7 @@ app.get('/api/entregas', async (req, res) => {
   }
 });
 
-// 2. CRIAR ENTREGA (ALTERADO: VINCULAÇÃO COM ENTREGA_ID NA MOVIMENTAÇÃO)
+// 2. CRIAR ENTREGA
 app.post('/api/entregas', async (req, res) => {
   const { 
     dataHoraSolicitacao, 
@@ -476,7 +483,7 @@ app.post('/api/entregas', async (req, res) => {
   }
 });
 
-// 3. ATUALIZAR ENTREGA (Lógica ajustada para permitir estoque negativo se confirmado)
+// 3. ATUALIZAR ENTREGA
 app.put('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const { 
@@ -522,9 +529,6 @@ app.put('/api/entregas/:id', async (req, res) => {
 
             if (!prodNovo) throw new Error('Novo produto selecionado não encontrado.');
             
-            // REMOVIDO: A verificação rígida de estoque insuficiente foi retirada.
-            // O frontend já avisou o usuário e ele confirmou. O estoque pode ficar negativo.
-
             // 3. Deduzir a nova quantidade
             await client.query(
                 'UPDATE produtos SET quantidade = quantidade - $1, atualizadoem = NOW() WHERE id = $2',
@@ -586,7 +590,7 @@ app.patch('/api/entregas/:id/status', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. EXCLUIR ENTREGA (COM ESTORNO AUTOMÁTICO - ALTERADO PARA REMOVER MOVIMENTAÇÃO VINCULADA)
+// 5. EXCLUIR ENTREGA
 app.delete('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
@@ -607,14 +611,6 @@ app.delete('/api/entregas/:id', async (req, res) => {
             'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
             [quantidadeEstorno, entrega.produto_id]
         );
-
-        // 3. (OPCIONAL/ALTERADO) Ao excluir a entrega, podemos querer limpar a movimentação original de SAÍDA também?
-        // No seu modelo original, você criava uma "Entrada" (Estorno) e mantinha a "Saída" original para histórico.
-        // Se quisermos manter o padrão "Desfazer completamente", podemos apagar a movimentação de saída vinculada.
-        // Caso contrário, mantemos o registro de que saiu e depois voltou (Estorno).
-        // VOU MANTER O SEU PADRÃO ORIGINAL AQUI (CRIA ESTORNO), pois é mais seguro para auditoria.
-        // Se você quisesse apagar tudo como se nunca tivesse existido, descomente a linha abaixo:
-        // await client.query('DELETE FROM movimentacoes WHERE entrega_id = $1', [id]);
 
         const motivoEstorno = `Estorno: Entrega excluída (Obra: ${entrega.local_obra})`;
         await client.query(
@@ -637,7 +633,7 @@ app.delete('/api/entregas/:id', async (req, res) => {
     }
 });
 
-// Rota para buscar apenas a lista de produtos para o 'autocomplete' (exemplo legado, ajustado)
+// Rota para buscar apenas a lista de produtos para o 'autocomplete'
 app.get('/api/produtos-lista', async (req, res) => {
     try {
         const { rows } = await pool.query("SELECT id, nome FROM produtos");
