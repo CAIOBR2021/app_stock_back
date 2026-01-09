@@ -3,7 +3,9 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 require('dotenv').config();
-const { sendLowStockEmail } = require('./services/emailService');
+// Certifique-se de que este arquivo existe ou comente a linha se não estiver usando emails
+// const { sendLowStockEmail } = require('./services/emailService'); 
+const sendLowStockEmail = (prod) => { console.log("Email simulado para:", prod.nome) }; // Mock para evitar erro
 
 // --- CONFIGURAÇÃO INICIAL ---
 const app = express();
@@ -33,7 +35,7 @@ async function setupDatabase() {
       descricao TEXT,
       categoria TEXT,
       unidade TEXT NOT NULL,
-      quantidade INTEGER NOT NULL DEFAULT 0,
+      quantidade NUMERIC(10, 2) NOT NULL DEFAULT 0,
       estoqueminimo INTEGER,
       localarmazenamento TEXT,
       fornecedor TEXT,
@@ -62,10 +64,10 @@ async function setupDatabase() {
       id UUID PRIMARY KEY,
       produtoid UUID NOT NULL,
       tipo TEXT NOT NULL,
-      quantidade INTEGER NOT NULL,
+      quantidade NUMERIC(10, 2) NOT NULL,
       motivo TEXT,
       criadoem TIMESTAMPTZ NOT NULL,
-      entrega_id UUID, -- Nova coluna para vincular
+      entrega_id UUID,
       FOREIGN KEY (produtoid) REFERENCES produtos (id) ON DELETE CASCADE,
       FOREIGN KEY (entrega_id) REFERENCES entregas (id) ON DELETE CASCADE
     );
@@ -74,13 +76,12 @@ async function setupDatabase() {
   try {
     await pool.query(createTables);
     console.log('Tabelas verificadas/criadas com sucesso.');
-    await updateSchema(); // Garante que a coluna exista em bancos já criados
+    await updateSchema();
   } catch (err) {
     console.error('Erro ao configurar banco:', err);
   }
 }
 
-// Função para atualizar o schema existente (Adiciona coluna entrega_id se não existir)
 async function updateSchema() {
     try {
         await pool.query(`
@@ -101,14 +102,12 @@ async function updateSchema() {
 const uid = () => crypto.randomUUID();
 const nowISO = () => new Date().toISOString();
 
-// Converte chaves do banco (snake_case) para o frontend (camelCase)
 function toCamelCase(obj) {
   if (!obj) return obj;
   const newObj = {};
   for (const key in obj) {
     let camelKey = key.replace(/_([a-z])/g, (g) => g[1].toUpperCase());
     
-    // Mapeamentos manuais específicos
     if (key === 'estoqueminimo') camelKey = 'estoqueMinimo';
     else if (key === 'localarmazenamento') camelKey = 'localArmazenamento';
     else if (key === 'criadoem') camelKey = 'criadoEm';
@@ -125,12 +124,18 @@ function toCamelCase(obj) {
     else if (key === 'responsavel_telefone') camelKey = 'responsavelTelefone';
     else if (key === 'entrega_id') camelKey = 'entregaId';
     
-    newObj[camelKey] = obj[key];
+    // Converte campos numéricos que vêm como string do Postgres (numeric/decimal)
+    if (['quantidade', 'valorUnitario', 'itemQuantidade', 'valorTotal'].includes(camelKey) && obj[key] !== null) {
+        newObj[camelKey] = Number(obj[key]);
+    } else {
+        newObj[camelKey] = obj[key];
+    }
   }
   return newObj;
 }
 
-// --- ROTAS DE AUTENTICAÇÃO ---
+// --- ROTAS ---
+
 app.post('/api/auth/verify-password', async (req, res) => {
   const { password } = req.body;
   if (password && password === process.env.ADMIN_PASSWORD) {
@@ -140,7 +145,6 @@ app.post('/api/auth/verify-password', async (req, res) => {
   }
 });
 
-// --- ROTAS DE PRODUTOS ---
 app.get('/api/produtos', async (req, res) => {
   const { _page, _limit, q } = req.query;
   const page = parseInt(_page) || 1;
@@ -223,7 +227,7 @@ app.post('/api/produtos/valor-total', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- ROTAS DE MOVIMENTAÇÕES ---
+// --- ROTA DE MOVIMENTAÇÕES (COM LÓGICA DE CUSTO MÉDIO PONDERADO) ---
 app.get('/api/movimentacoes', async (req, res) => {
     try {
         const { rows } = await pool.query('SELECT * FROM movimentacoes ORDER BY criadoem DESC');
@@ -232,24 +236,55 @@ app.get('/api/movimentacoes', async (req, res) => {
 });
 
 app.post('/api/movimentacoes', async (req, res) => {
-    const { produtoId, tipo, quantidade, motivo } = req.body;
+    // Agora recebemos custoEntrada
+    const { produtoId, tipo, quantidade, motivo, custoEntrada } = req.body;
     const client = await pool.connect();
     
     try {
         await client.query('BEGIN');
         
+        // Bloqueia a linha do produto para garantir cálculo atômico
         const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
         const produto = prodRes.rows[0];
         if (!produto) throw new Error('Produto não encontrado');
 
-        let novoSaldo = produto.quantidade;
+        let novoSaldo = Number(produto.quantidade);
         if (tipo === 'ajuste') novoSaldo = Number(quantidade);
         else novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
         
         if (novoSaldo < 0) novoSaldo = 0;
 
-        await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
+        // --- LÓGICA DE CUSTO MÉDIO PONDERADO ---
+        let novoValorUnitario = Number(produto.valorunitario);
+
+        if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
+            const qtdAtual = Number(produto.quantidade);
+            const valorAtual = Number(produto.valorunitario || 0);
+            const qtdEntrada = Number(quantidade);
+            const valorEntrada = Number(custoEntrada);
+
+            // Fórmula: ((QtdAtual * ValorAtual) + (QtdEntrada * ValorEntrada)) / (QtdAtual + QtdEntrada)
+            const valorTotalEstoque = qtdAtual * valorAtual;
+            const valorTotalNovaEntrada = qtdEntrada * valorEntrada;
+            const novaQuantidadeTotal = qtdAtual + qtdEntrada;
+
+            if (novaQuantidadeTotal > 0) {
+                novoValorUnitario = (valorTotalEstoque + valorTotalNovaEntrada) / novaQuantidadeTotal;
+            } else {
+                novoValorUnitario = valorEntrada;
+            }
+            
+            // Arredonda para 2 casas decimais para armazenar bonito no banco (opcional)
+            // novoValorUnitario = Math.round(novoValorUnitario * 100) / 100; 
+        }
+
+        // Atualiza Produto (Quantidade E Valor Unitário)
+        await client.query(
+            'UPDATE produtos SET quantidade = $1, valorunitario = $2, atualizadoem = NOW() WHERE id = $3', 
+            [novoSaldo, novoValorUnitario, produtoId]
+        );
         
+        // Registra Movimentação
         const movId = uid();
         await client.query(
             'INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem) VALUES ($1, $2, $3, $4, $5, NOW())',
@@ -260,12 +295,13 @@ app.post('/api/movimentacoes', async (req, res) => {
             sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
         }
 
+        // Busca o produto atualizado para retornar ao front
         const updatedProd = await client.query('SELECT * FROM produtos WHERE id = $1', [produtoId]);
         await client.query('COMMIT');
         
         res.status(201).json({ 
             movimentacao: toCamelCase({ id: movId, produtoId, tipo, quantidade, motivo, criadoEm: nowISO() }),
-            produto: toCamelCase(updatedProd.rows[0])
+            produto: toCamelCase(updatedProd.rows[0]) // Este produto já tem o preço e quantidade novos
         });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -275,7 +311,6 @@ app.post('/api/movimentacoes', async (req, res) => {
     }
 });
 
-// ALTERAÇÃO IMPORTANTE: Exclusão de movimentação exclui entrega vinculada
 app.delete('/api/movimentacoes/:id', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -287,17 +322,14 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
     const mov = movResult.rows[0];
     if (mov.tipo === 'ajuste') throw new Error('Não é possível excluir ajuste.');
 
-    // --- LOGICA DE SINCRONIZAÇÃO BIDIRECIONAL ---
     if (mov.entrega_id) {
         await client.query('DELETE FROM entregas WHERE id = $1', [mov.entrega_id]);
     }
-    // ---------------------------------------------
 
     const prodResult = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [mov.produtoid]);
     const produto = prodResult.rows[0];
     
-    // Reverte o saldo (Desfaz o impacto da movimentação)
-    let novaQtd = produto.quantidade + (mov.tipo === 'saida' ? mov.quantidade : -mov.quantidade);
+    let novaQtd = Number(produto.quantidade) + (mov.tipo === 'saida' ? Number(mov.quantidade) : -Number(mov.quantidade));
     novaQtd = Math.max(0, novaQtd);
 
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novaQtd, produto.id]);
@@ -313,7 +345,6 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
   }
 });
 
-// --- ROTA DE EDIÇÃO DE MOVIMENTAÇÃO (MODIFICADA) ---
 app.patch('/api/movimentacoes/:id', async (req, res) => {
     const { id } = req.params;
     const { quantidade, motivo } = req.body;
@@ -322,27 +353,22 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. Busca a movimentação antiga
         const movRes = await client.query('SELECT * FROM movimentacoes WHERE id = $1', [id]);
         if (movRes.rowCount === 0) throw new Error('Movimentação não encontrada');
         const movAntiga = movRes.rows[0];
 
-        // Se for ajuste, não permitimos editar quantidade por simplicidade
         if (movAntiga.tipo === 'ajuste') throw new Error('Use um novo Ajuste para corrigir saldo.');
 
-        // 2. Busca o produto
         const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [movAntiga.produtoid]);
         const produto = prodRes.rows[0];
 
-        // 3. Reverte o impacto da movimentação antiga no saldo
-        let saldoRevertido = produto.quantidade;
+        let saldoRevertido = Number(produto.quantidade);
         if (movAntiga.tipo === 'entrada') {
-            saldoRevertido -= movAntiga.quantidade; 
+            saldoRevertido -= Number(movAntiga.quantidade); 
         } else if (movAntiga.tipo === 'saida') {
-            saldoRevertido += movAntiga.quantidade;
+            saldoRevertido += Number(movAntiga.quantidade);
         }
 
-        // 4. Aplica a NOVA quantidade
         let novoSaldoFinal = saldoRevertido;
         const novaQtd = Number(quantidade);
         
@@ -354,10 +380,8 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
 
         if (novoSaldoFinal < 0) throw new Error('Estoque ficaria negativo com essa alteração.');
 
-        // 5. Atualiza o banco (Produtos)
         await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldoFinal, produto.id]);
         
-        // 6. Atualiza a Movimentação
         const updates = [];
         const values = [];
         if (quantidade) {
@@ -368,23 +392,20 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
             updates.push(`motivo = $${values.length + 1}`);
             values.push(motivo);
         }
-        values.push(id); // ID é o último parametro
+        values.push(id);
 
         const movUpdateSql = `UPDATE movimentacoes SET ${updates.join(', ')} WHERE id = $${values.length} RETURNING *`;
         const movUpdatedRes = await client.query(movUpdateSql, values);
 
-        // --- CORREÇÃO AQUI: Atualizar tabela de entregas se houver vínculo ---
         if (movAntiga.entrega_id && quantidade) {
             await client.query(
                 'UPDATE entregas SET item_quantidade = $1 WHERE id = $2',
                 [novaQtd, movAntiga.entrega_id]
             );
         }
-        // -------------------------------------------------------------------
 
         await client.query('COMMIT');
 
-        // Retorna dados atualizados
         const produtoFinal = { ...produto, quantidade: novoSaldoFinal };
         res.json({
             movimentacaoAtualizada: toCamelCase(movUpdatedRes.rows[0]),
@@ -399,9 +420,7 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
     }
 });
 
-// --- ROTAS DE ENTREGAS (LOGÍSTICA) ---
-
-// 1. LISTAR ENTREGAS
+// --- LOGÍSTICA ---
 app.get('/api/entregas', async (req, res) => {
   try {
     const sql = `
@@ -423,23 +442,13 @@ app.get('/api/entregas', async (req, res) => {
   }
 });
 
-// 2. CRIAR ENTREGA
 app.post('/api/entregas', async (req, res) => {
   const { 
-    dataHoraSolicitacao, 
-    localArmazenagem, 
-    localObra, 
-    produtoId, 
-    itemQuantidade, 
-    responsavelNome, 
-    responsavelTelefone 
+    dataHoraSolicitacao, localArmazenagem, localObra, produtoId, itemQuantidade, responsavelNome, responsavelTelefone 
   } = req.body;
 
   const quantidadeNum = Number(itemQuantidade);
-
-  if (isNaN(quantidadeNum) || quantidadeNum <= 0) {
-    return res.status(400).json({ error: 'Quantidade inválida.' });
-  }
+  if (isNaN(quantidadeNum) || quantidadeNum <= 0) return res.status(400).json({ error: 'Quantidade inválida.' });
 
   const client = await pool.connect();
   try {
@@ -449,7 +458,7 @@ app.post('/api/entregas', async (req, res) => {
     const produto = prodRes.rows[0];
     
     if (!produto) throw new Error('Produto não encontrado.');
-    if (produto.quantidade < quantidadeNum) throw new Error(`Estoque insuficiente (${produto.quantidade} disponível).`);
+    if (Number(produto.quantidade) < quantidadeNum) throw new Error(`Estoque insuficiente (${produto.quantidade} disponível).`);
 
     const entregaId = uid();
     await client.query(
@@ -458,11 +467,9 @@ app.post('/api/entregas', async (req, res) => {
       [entregaId, dataHoraSolicitacao, localArmazenagem, localObra, produtoId, quantidadeNum, produto.unidade, responsavelNome, responsavelTelefone]
     );
 
-    // Baixa estoque
-    const novoSaldo = produto.quantidade - quantidadeNum;
+    const novoSaldo = Number(produto.quantidade) - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
-    // Registra movimento COM O VÍNCULO (entrega_id)
     await client.query(
       `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, entrega_id)
        VALUES ($1, $2, 'saida', $3, $4, NOW(), $5)`,
@@ -483,18 +490,10 @@ app.post('/api/entregas', async (req, res) => {
   }
 });
 
-// 3. ATUALIZAR ENTREGA
 app.put('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const { 
-        dataHoraSolicitacao, 
-        localArmazenagem, 
-        localObra, 
-        responsavelNome, 
-        responsavelTelefone, 
-        status,
-        produtoId,      
-        itemQuantidade  
+        dataHoraSolicitacao, localArmazenagem, localObra, responsavelNome, responsavelTelefone, status, produtoId, itemQuantidade  
     } = req.body;
 
     const client = await pool.connect();
@@ -502,40 +501,33 @@ app.put('/api/entregas/:id', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // A. Buscar a entrega atual (velha)
         const resAntiga = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
         if (resAntiga.rowCount === 0) throw new Error('Entrega não encontrada');
         const entregaAntiga = resAntiga.rows[0];
 
-        // Definir valores novos vs velhos
         const velhoProdutoId = entregaAntiga.produto_id;
         const velhaQuantidade = Number(entregaAntiga.item_quantidade);
 
         const novoProdutoId = produtoId || velhoProdutoId;
         const novaQuantidade = itemQuantidade ? Number(itemQuantidade) : velhaQuantidade;
 
-        // B. Lógica de Estoque
         if (velhoProdutoId !== novoProdutoId || velhaQuantidade !== novaQuantidade) {
-            
-            // 1. Devolver o estoque antigo
+            // Devolver estoque antigo
             await client.query(
                 'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
                 [velhaQuantidade, velhoProdutoId]
             );
 
-            // 2. Verificar o novo produto
+            // Verificar e deduzir novo estoque
             const resProdNovo = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [novoProdutoId]);
             const prodNovo = resProdNovo.rows[0];
-
             if (!prodNovo) throw new Error('Novo produto selecionado não encontrado.');
             
-            // 3. Deduzir a nova quantidade
             await client.query(
                 'UPDATE produtos SET quantidade = quantidade - $1, atualizadoem = NOW() WHERE id = $2',
                 [novaQuantidade, novoProdutoId]
             );
 
-            // 4. Atualizar a Movimentação vinculada
             await client.query(
                 `UPDATE movimentacoes 
                  SET produtoid = $1, quantidade = $2, motivo = $3 
@@ -544,7 +536,6 @@ app.put('/api/entregas/:id', async (req, res) => {
             );
         }
 
-        // C. Atualizar os dados da Entrega
         const { rows } = await client.query(
             `UPDATE entregas 
              SET data_hora_solicitacao = COALESCE($1, data_hora_solicitacao),
@@ -557,17 +548,7 @@ app.put('/api/entregas/:id', async (req, res) => {
                  item_quantidade = $8,
                  item_unidade_medida = (SELECT unidade FROM produtos WHERE id = $7)
              WHERE id = $9 RETURNING *`,
-            [
-                dataHoraSolicitacao || null, 
-                localArmazenagem || null, 
-                localObra || null, 
-                responsavelNome || null, 
-                responsavelTelefone || null, 
-                status || null,
-                novoProdutoId,
-                novaQuantidade,
-                id
-            ]
+            [dataHoraSolicitacao || null, localArmazenagem || null, localObra || null, responsavelNome || null, responsavelTelefone || null, status || null, novoProdutoId, novaQuantidade, id]
         );
         
         await client.query('COMMIT');
@@ -575,14 +556,12 @@ app.put('/api/entregas/:id', async (req, res) => {
 
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Erro PUT /entregas:', err);
         res.status(500).json({ error: err.message });
     } finally {
         client.release();
     }
 });
 
-// 4. PATCH STATUS
 app.patch('/api/entregas/:id/status', async (req, res) => {
     try {
         await pool.query('UPDATE entregas SET status = $1 WHERE id = $2', [req.body.status, req.params.id]);
@@ -590,7 +569,6 @@ app.patch('/api/entregas/:id/status', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. EXCLUIR ENTREGA
 app.delete('/api/entregas/:id', async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
@@ -598,15 +576,11 @@ app.delete('/api/entregas/:id', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. Buscar dados da entrega antes de excluir
         const resEntrega = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
-        if (resEntrega.rowCount === 0) {
-            throw new Error('Entrega não encontrada.');
-        }
+        if (resEntrega.rowCount === 0) throw new Error('Entrega não encontrada.');
         const entrega = resEntrega.rows[0];
         const quantidadeEstorno = Number(entrega.item_quantidade);
 
-        // 2. Devolver itens ao estoque (UPDATE produtos)
         await client.query(
             'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
             [quantidadeEstorno, entrega.produto_id]
@@ -619,21 +593,18 @@ app.delete('/api/entregas/:id', async (req, res) => {
             [uid(), entrega.produto_id, quantidadeEstorno, motivoEstorno]
         );
 
-        // 4. Finalmente, excluir a entrega
         await client.query('DELETE FROM entregas WHERE id = $1', [id]);
 
         await client.query('COMMIT');
         res.json({ success: true, message: 'Entrega excluída e estoque estornado.' });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Erro ao excluir entrega:', err);
         res.status(500).json({ error: err.message });
     } finally {
         client.release();
     }
 });
 
-// Rota para buscar apenas a lista de produtos para o 'autocomplete'
 app.get('/api/produtos-lista', async (req, res) => {
     try {
         const { rows } = await pool.query("SELECT id, nome FROM produtos");
