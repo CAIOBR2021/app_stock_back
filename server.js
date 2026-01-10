@@ -3,6 +3,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 require('dotenv').config();
+
 // Certifique-se de que este arquivo existe ou comente a linha se não estiver usando emails
 // const { sendLowStockEmail } = require('./services/emailService'); 
 const sendLowStockEmail = (prod) => { console.log("Email simulado para:", prod.nome) }; // Mock para evitar erro
@@ -254,14 +255,23 @@ app.post('/api/movimentacoes', async (req, res) => {
         
         if (novoSaldo < 0) novoSaldo = 0;
 
-        // --- LÓGICA DE CUSTO MÉDIO PONDERADO ---
+        // --- LÓGICA DE CUSTO MÉDIO PONDERADO COM CORREÇÃO RETROATIVA ---
         let novoValorUnitario = Number(produto.valorunitario);
 
         if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
             const qtdAtual = Number(produto.quantidade);
-            const valorAtual = Number(produto.valorunitario || 0);
+            let valorAtual = Number(produto.valorunitario || 0); // let permite reatribuição local
+            
             const qtdEntrada = Number(quantidade);
             const valorEntrada = Number(custoEntrada);
+
+            // REGRA DE CORREÇÃO: 
+            // Se temos estoque físico anterior (qtdAtual > 0) mas o valor registrado era ZERO (ex: não informado na 1ª entrada),
+            // assumimos retroativamente que o valor daquele estoque é igual ao valor atual de entrada.
+            // Isso evita diluir o preço para baixo artificialmente.
+            if (qtdAtual > 0 && valorAtual === 0) {
+                valorAtual = valorEntrada;
+            }
 
             // Fórmula: ((QtdAtual * ValorAtual) + (QtdEntrada * ValorEntrada)) / (QtdAtual + QtdEntrada)
             const valorTotalEstoque = qtdAtual * valorAtual;
@@ -274,7 +284,7 @@ app.post('/api/movimentacoes', async (req, res) => {
                 novoValorUnitario = valorEntrada;
             }
             
-            // Arredonda para 2 casas decimais para armazenar bonito no banco (opcional)
+            // Arredonda para 2 casas decimais (opcional, mas recomendado para moeda)
             // novoValorUnitario = Math.round(novoValorUnitario * 100) / 100; 
         }
 
