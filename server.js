@@ -5,8 +5,8 @@ const { Pool } = require('pg');
 require('dotenv').config();
 
 // Certifique-se de que este arquivo existe ou comente a linha se não estiver usando emails
-// const { sendLowStockEmail } = require('./services/emailService'); 
-const sendLowStockEmail = (prod) => { console.log("Email simulado para:", prod.nome) }; // Mock para evitar erro
+const { sendLowStockEmail } = require('./services/emailService'); 
+// const sendLowStockEmail = (prod) => { console.log("Email simulado para:", prod.nome) }; // Mock para evitar erro
 
 // --- CONFIGURAÇÃO INICIAL ---
 const app = express();
@@ -533,9 +533,17 @@ app.put('/api/entregas/:id', async (req, res) => {
             const prodNovo = resProdNovo.rows[0];
             if (!prodNovo) throw new Error('Novo produto selecionado não encontrado.');
             
+            // --- MODIFICAÇÃO: Verificação de segurança para não deixar estoque negativo ---
+            if (Number(prodNovo.quantidade) < novaQuantidade) {
+                 throw new Error(`Estoque insuficiente (${prodNovo.quantidade} disponível).`);
+            }
+
+            // Calculando novo saldo para verificação
+            const novoSaldo = Number(prodNovo.quantidade) - novaQuantidade;
+
             await client.query(
-                'UPDATE produtos SET quantidade = quantidade - $1, atualizadoem = NOW() WHERE id = $2',
-                [novaQuantidade, novoProdutoId]
+                'UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2',
+                [novoSaldo, novoProdutoId]
             );
 
             await client.query(
@@ -544,6 +552,11 @@ app.put('/api/entregas/:id', async (req, res) => {
                  WHERE entrega_id = $4 AND tipo = 'saida'`,
                 [novoProdutoId, novaQuantidade, `Entrega Editada: ${localObra || entregaAntiga.local_obra}`, id]
             );
+
+            // --- MODIFICAÇÃO: Verificação de Estoque Mínimo e Envio de Email ---
+            if (prodNovo.estoqueminimo !== null && novoSaldo <= prodNovo.estoqueminimo) {
+                 sendLowStockEmail(toCamelCase({ ...prodNovo, quantidade: novoSaldo }));
+            }
         }
 
         const { rows } = await client.query(
