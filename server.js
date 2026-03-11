@@ -19,6 +19,10 @@ app.use(express.json());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  // Opções para manter conexões abertas e melhorar a performance
+  max: 20, 
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
 pool.connect().then(() => {
@@ -69,6 +73,9 @@ async function setupDatabase() {
       motivo TEXT,
       criadoem TIMESTAMPTZ NOT NULL,
       entrega_id UUID,
+      nome_obra TEXT,
+      ordem_compra TEXT,
+      custo_unitario_historico NUMERIC(10, 2),
       FOREIGN KEY (produtoid) REFERENCES produtos (id) ON DELETE CASCADE,
       FOREIGN KEY (entrega_id) REFERENCES entregas (id) ON DELETE CASCADE
     );
@@ -85,15 +92,34 @@ async function setupDatabase() {
 
 async function updateSchema() {
     try {
+        // Atualiza a estrutura para incluir as novas colunas
         await pool.query(`
             DO $$ 
             BEGIN 
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='entrega_id') THEN 
                     ALTER TABLE movimentacoes ADD COLUMN entrega_id UUID REFERENCES entregas(id) ON DELETE CASCADE; 
                 END IF; 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='nome_obra') THEN 
+                    ALTER TABLE movimentacoes ADD COLUMN nome_obra TEXT; 
+                END IF; 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='ordem_compra') THEN 
+                    ALTER TABLE movimentacoes ADD COLUMN ordem_compra TEXT; 
+                END IF; 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN 
+                    ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2); 
+                END IF; 
             END $$;
         `);
-        console.log('Schema atualizado (coluna entrega_id verificada).');
+
+        // Criação de Índices (Melhora drasticamente a performance de buscas e listagens)
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_movimentacoes_criadoem ON movimentacoes(criadoem DESC);
+            CREATE INDEX IF NOT EXISTS idx_movimentacoes_produtoid ON movimentacoes(produtoid);
+            CREATE INDEX IF NOT EXISTS idx_produtos_nome ON produtos(nome);
+            CREATE INDEX IF NOT EXISTS idx_entregas_data ON entregas(data_hora_solicitacao DESC);
+        `);
+
+        console.log('Schema atualizado com sucesso (novas colunas e índices de performance aplicados).');
     } catch (err) {
         console.error('Erro ao atualizar schema:', err.message);
     }
@@ -109,6 +135,7 @@ function toCamelCase(obj) {
   for (const key in obj) {
     let camelKey = key.replace(/_([a-z])/g, (g) => g[1].toUpperCase());
     
+    // Mapeamentos específicos
     if (key === 'estoqueminimo') camelKey = 'estoqueMinimo';
     else if (key === 'localarmazenamento') camelKey = 'localArmazenamento';
     else if (key === 'criadoem') camelKey = 'criadoEm';
@@ -124,9 +151,12 @@ function toCamelCase(obj) {
     else if (key === 'responsavel_nome') camelKey = 'responsavelNome';
     else if (key === 'responsavel_telefone') camelKey = 'responsavelTelefone';
     else if (key === 'entrega_id') camelKey = 'entregaId';
+    else if (key === 'nome_obra') camelKey = 'nomeObra';
+    else if (key === 'ordem_compra') camelKey = 'ordemCompra';
+    else if (key === 'custo_unitario_historico') camelKey = 'custoUnitarioHistorico';
     
     // Converte campos numéricos que vêm como string do Postgres (numeric/decimal)
-    if (['quantidade', 'valorUnitario', 'itemQuantidade', 'valorTotal'].includes(camelKey) && obj[key] !== null) {
+    if (['quantidade', 'valorUnitario', 'itemQuantidade', 'valorTotal', 'custoUnitarioHistorico'].includes(camelKey) && obj[key] !== null) {
         newObj[camelKey] = Number(obj[key]);
     } else {
         newObj[camelKey] = obj[key];
@@ -228,7 +258,7 @@ app.post('/api/produtos/valor-total', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- ROTA DE MOVIMENTAÇÕES (COM LÓGICA DE CUSTO MÉDIO PONDERADO) ---
+// --- ROTA DE MOVIMENTAÇÕES ---
 app.get('/api/movimentacoes', async (req, res) => {
     try {
         const { rows } = await pool.query('SELECT * FROM movimentacoes ORDER BY criadoem DESC');
@@ -237,8 +267,8 @@ app.get('/api/movimentacoes', async (req, res) => {
 });
 
 app.post('/api/movimentacoes', async (req, res) => {
-    // Agora recebemos custoEntrada
-    const { produtoId, tipo, quantidade, motivo, custoEntrada } = req.body;
+    // Novas propriedades integradas: nomeObra, ordemCompra e custoUnitarioHistorico
+    const { produtoId, tipo, quantidade, motivo, custoEntrada, nomeObra, ordemCompra, custoUnitarioHistorico } = req.body;
     const client = await pool.connect();
     
     try {
@@ -260,20 +290,16 @@ app.post('/api/movimentacoes', async (req, res) => {
 
         if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
             const qtdAtual = Number(produto.quantidade);
-            let valorAtual = Number(produto.valorunitario || 0); // let permite reatribuição local
+            let valorAtual = Number(produto.valorunitario || 0); 
             
             const qtdEntrada = Number(quantidade);
             const valorEntrada = Number(custoEntrada);
 
-            // REGRA DE CORREÇÃO: 
-            // Se temos estoque físico anterior (qtdAtual > 0) mas o valor registrado era ZERO (ex: não informado na 1ª entrada),
-            // assumimos retroativamente que o valor daquele estoque é igual ao valor atual de entrada.
-            // Isso evita diluir o preço para baixo artificialmente.
+            // Correção de preço inicial zero com saldo existente
             if (qtdAtual > 0 && valorAtual === 0) {
                 valorAtual = valorEntrada;
             }
 
-            // Fórmula: ((QtdAtual * ValorAtual) + (QtdEntrada * ValorEntrada)) / (QtdAtual + QtdEntrada)
             const valorTotalEstoque = qtdAtual * valorAtual;
             const valorTotalNovaEntrada = qtdEntrada * valorEntrada;
             const novaQuantidadeTotal = qtdAtual + qtdEntrada;
@@ -283,9 +309,6 @@ app.post('/api/movimentacoes', async (req, res) => {
             } else {
                 novoValorUnitario = valorEntrada;
             }
-            
-            // Arredonda para 2 casas decimais (opcional, mas recomendado para moeda)
-            // novoValorUnitario = Math.round(novoValorUnitario * 100) / 100; 
         }
 
         // Atualiza Produto (Quantidade E Valor Unitário)
@@ -294,11 +317,13 @@ app.post('/api/movimentacoes', async (req, res) => {
             [novoSaldo, novoValorUnitario, produtoId]
         );
         
-        // Registra Movimentação
+        // Registra Movimentação com os novos campos
         const movId = uid();
         await client.query(
-            'INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem) VALUES ($1, $2, $3, $4, $5, NOW())',
-            [movId, produtoId, tipo, Number(quantidade), motivo]
+            `INSERT INTO movimentacoes 
+             (id, produtoid, tipo, quantidade, motivo, criadoem, nome_obra, ordem_compra, custo_unitario_historico) 
+             VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8)`,
+            [movId, produtoId, tipo, Number(quantidade), motivo, nomeObra || null, ordemCompra || null, custoUnitarioHistorico !== undefined ? Number(custoUnitarioHistorico) : null]
         );
 
         if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
@@ -310,8 +335,18 @@ app.post('/api/movimentacoes', async (req, res) => {
         await client.query('COMMIT');
         
         res.status(201).json({ 
-            movimentacao: toCamelCase({ id: movId, produtoId, tipo, quantidade, motivo, criadoEm: nowISO() }),
-            produto: toCamelCase(updatedProd.rows[0]) // Este produto já tem o preço e quantidade novos
+            movimentacao: toCamelCase({ 
+                id: movId, 
+                produtoId, 
+                tipo, 
+                quantidade, 
+                motivo, 
+                criadoEm: nowISO(),
+                nome_obra: nomeObra,
+                ordem_compra: ordemCompra,
+                custo_unitario_historico: custoUnitarioHistorico
+            }),
+            produto: toCamelCase(updatedProd.rows[0]) 
         });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -480,10 +515,11 @@ app.post('/api/entregas', async (req, res) => {
     const novoSaldo = Number(produto.quantidade) - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
+    // Grava também na movimentação a obra da entrega
     await client.query(
-      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, entrega_id)
-       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5)`,
-      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`, entregaId]
+      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, entrega_id, nome_obra)
+       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6)`,
+      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`, entregaId, localObra]
     );
 
     if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
@@ -533,7 +569,6 @@ app.put('/api/entregas/:id', async (req, res) => {
             const prodNovo = resProdNovo.rows[0];
             if (!prodNovo) throw new Error('Novo produto selecionado não encontrado.');
             
-            // --- MODIFICAÇÃO: Verificação de segurança para não deixar estoque negativo ---
             if (Number(prodNovo.quantidade) < novaQuantidade) {
                  throw new Error(`Estoque insuficiente (${prodNovo.quantidade} disponível).`);
             }
@@ -546,14 +581,14 @@ app.put('/api/entregas/:id', async (req, res) => {
                 [novoSaldo, novoProdutoId]
             );
 
+            // Atualiza a movimentação ligada à entrega
             await client.query(
                 `UPDATE movimentacoes 
-                 SET produtoid = $1, quantidade = $2, motivo = $3 
-                 WHERE entrega_id = $4 AND tipo = 'saida'`,
-                [novoProdutoId, novaQuantidade, `Entrega Editada: ${localObra || entregaAntiga.local_obra}`, id]
+                 SET produtoid = $1, quantidade = $2, motivo = $3, nome_obra = $4
+                 WHERE entrega_id = $5 AND tipo = 'saida'`,
+                [novoProdutoId, novaQuantidade, `Entrega Editada: ${localObra || entregaAntiga.local_obra}`, localObra || entregaAntiga.local_obra, id]
             );
 
-            // --- MODIFICAÇÃO: Verificação de Estoque Mínimo e Envio de Email ---
             if (prodNovo.estoqueminimo !== null && novoSaldo <= prodNovo.estoqueminimo) {
                  sendLowStockEmail(toCamelCase({ ...prodNovo, quantidade: novoSaldo }));
             }
