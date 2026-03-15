@@ -167,6 +167,11 @@ function toCamelCase(obj) {
 
 // --- ROTAS ---
 
+// Rota Keep-Alive para evitar hibernação no Koyeb (UptimeRobot)
+app.get('/ping', (req, res) => {
+  res.status(200).send('Servidor ativo');
+});
+
 app.post('/api/auth/verify-password', async (req, res) => {
   const { password } = req.body;
   if (password && password === process.env.ADMIN_PASSWORD) {
