@@ -4,9 +4,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 require('dotenv').config();
 
-// Certifique-se de que este arquivo existe ou comente a linha se não estiver usando emails
 const { sendLowStockEmail } = require('./services/emailService'); 
-// const sendLowStockEmail = (prod) => { console.log("Email simulado para:", prod.nome) }; // Mock para evitar erro
 
 // --- CONFIGURAÇÃO INICIAL ---
 const app = express();
@@ -19,7 +17,6 @@ app.use(express.json());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  // Opções para manter conexões abertas e melhorar a performance
   max: 20, 
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
@@ -91,43 +88,51 @@ async function setupDatabase() {
 }
 
 async function updateSchema() {
-    try {
-        // Atualiza a estrutura para incluir as novas colunas
-        await pool.query(`
-            DO $$ 
-            BEGIN 
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='entrega_id') THEN 
-                    ALTER TABLE movimentacoes ADD COLUMN entrega_id UUID REFERENCES entregas(id) ON DELETE CASCADE; 
-                END IF; 
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='nome_obra') THEN 
-                    ALTER TABLE movimentacoes ADD COLUMN nome_obra TEXT; 
-                END IF; 
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='ordem_compra') THEN 
-                    ALTER TABLE movimentacoes ADD COLUMN ordem_compra TEXT; 
-                END IF; 
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN 
-                    ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2); 
-                END IF; 
-            END $$;
-        `);
+  try {
+    await pool.query(`
+      DO $$ 
+      BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='entrega_id') THEN 
+          ALTER TABLE movimentacoes ADD COLUMN entrega_id UUID REFERENCES entregas(id) ON DELETE CASCADE; 
+        END IF; 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='nome_obra') THEN 
+          ALTER TABLE movimentacoes ADD COLUMN nome_obra TEXT; 
+        END IF; 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='ordem_compra') THEN 
+          ALTER TABLE movimentacoes ADD COLUMN ordem_compra TEXT; 
+        END IF; 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN 
+          ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2); 
+        END IF;
+        -- MUDANCA 1: coluna para data de competencia (suporte a retroativos)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='data_competencia') THEN 
+          ALTER TABLE movimentacoes ADD COLUMN data_competencia DATE;
+          UPDATE movimentacoes SET data_competencia = criadoem::DATE WHERE data_competencia IS NULL;
+        END IF;
+      END $$;
+    `);
 
-        // Criação de Índices (Melhora drasticamente a performance de buscas e listagens)
-        await pool.query(`
-            CREATE INDEX IF NOT EXISTS idx_movimentacoes_criadoem ON movimentacoes(criadoem DESC);
-            CREATE INDEX IF NOT EXISTS idx_movimentacoes_produtoid ON movimentacoes(produtoid);
-            CREATE INDEX IF NOT EXISTS idx_produtos_nome ON produtos(nome);
-            CREATE INDEX IF NOT EXISTS idx_entregas_data ON entregas(data_hora_solicitacao DESC);
-        `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_movimentacoes_criadoem ON movimentacoes(criadoem DESC);
+      CREATE INDEX IF NOT EXISTS idx_movimentacoes_produtoid ON movimentacoes(produtoid);
+      CREATE INDEX IF NOT EXISTS idx_produtos_nome ON produtos(nome);
+      CREATE INDEX IF NOT EXISTS idx_entregas_data ON entregas(data_hora_solicitacao DESC);
+      CREATE INDEX IF NOT EXISTS idx_movimentacoes_produto_data_competencia
+        ON movimentacoes(produtoid, data_competencia DESC, criadoem DESC);
+    `);
 
-        console.log('Schema atualizado com sucesso (novas colunas e índices de performance aplicados).');
-    } catch (err) {
-        console.error('Erro ao atualizar schema:', err.message);
-    }
+    console.log('Schema atualizado com sucesso (novas colunas e indices de performance aplicados).');
+  } catch (err) {
+    console.error('Erro ao atualizar schema:', err.message);
+  }
 }
 
-// --- UTILITÁRIOS ---
+// --- UTILITARIOS ---
 const uid = () => crypto.randomUUID();
 const nowISO = () => new Date().toISOString();
+
+// MUDANCA 2: helper para data de hoje no formato YYYY-MM-DD
+const hojeISO = () => new Date().toISOString().split('T')[0];
 
 function toCamelCase(obj) {
   if (!obj) return obj;
@@ -135,7 +140,6 @@ function toCamelCase(obj) {
   for (const key in obj) {
     let camelKey = key.replace(/_([a-z])/g, (g) => g[1].toUpperCase());
     
-    // Mapeamentos específicos
     if (key === 'estoqueminimo') camelKey = 'estoqueMinimo';
     else if (key === 'localarmazenamento') camelKey = 'localArmazenamento';
     else if (key === 'criadoem') camelKey = 'criadoEm';
@@ -154,20 +158,86 @@ function toCamelCase(obj) {
     else if (key === 'nome_obra') camelKey = 'nomeObra';
     else if (key === 'ordem_compra') camelKey = 'ordemCompra';
     else if (key === 'custo_unitario_historico') camelKey = 'custoUnitarioHistorico';
+    else if (key === 'data_competencia') camelKey = 'dataCompetencia'; // NOVO
     
-    // Converte campos numéricos que vêm como string do Postgres (numeric/decimal)
     if (['quantidade', 'valorUnitario', 'itemQuantidade', 'valorTotal', 'custoUnitarioHistorico'].includes(camelKey) && obj[key] !== null) {
-        newObj[camelKey] = Number(obj[key]);
+      newObj[camelKey] = Number(obj[key]);
     } else {
-        newObj[camelKey] = obj[key];
+      newObj[camelKey] = obj[key];
     }
   }
   return newObj;
 }
 
+// MUDANCA 3: validacao de saida retroativa
+// Garante que havia saldo suficiente na data informada.
+// Entradas retroativas nunca precisam de validacao.
+async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompetencia) {
+  // Busca o ultimo ajuste ate a data — ponto de partida mais confiavel
+  const { rows: ajusteRows } = await client.query(`
+    SELECT quantidade, data_competencia, criadoem
+    FROM movimentacoes
+    WHERE produtoid = $1
+      AND tipo = 'ajuste'
+      AND data_competencia <= $2
+    ORDER BY data_competencia DESC, criadoem DESC
+    LIMIT 1
+  `, [produtoId, dataCompetencia]);
+
+  let saldoNaData;
+
+  if (ajusteRows.length > 0) {
+    // Tem ajuste: saldo = valor do ajuste + movimentacoes apos o ajuste ate a data
+    const ajuste = ajusteRows[0];
+    const { rows: posAjuste } = await client.query(`
+      SELECT COALESCE(SUM(
+        CASE tipo
+          WHEN 'entrada' THEN  quantidade
+          WHEN 'saida'   THEN -quantidade
+          ELSE 0
+        END
+      ), 0) AS delta
+      FROM movimentacoes
+      WHERE produtoid = $1
+        AND tipo IN ('entrada', 'saida')
+        AND (
+          data_competencia > $2
+          OR (data_competencia = $2 AND criadoem > $3)
+        )
+        AND data_competencia <= $4
+    `, [produtoId, ajuste.data_competencia, ajuste.criadoem, dataCompetencia]);
+
+    saldoNaData = Number(ajuste.quantidade) + Number(posAjuste[0].delta);
+  } else {
+    // Sem ajuste: reconstroi do zero
+    const { rows } = await client.query(`
+      SELECT COALESCE(SUM(
+        CASE tipo
+          WHEN 'entrada' THEN  quantidade
+          WHEN 'saida'   THEN -quantidade
+          ELSE 0
+        END
+      ), 0) AS saldo
+      FROM movimentacoes
+      WHERE produtoid = $1
+        AND tipo IN ('entrada', 'saida')
+        AND data_competencia <= $2
+    `, [produtoId, dataCompetencia]);
+
+    saldoNaData = Number(rows[0].saldo);
+  }
+
+  if (saldoNaData < Number(quantidade)) {
+    throw new Error(
+      `Saldo insuficiente na data ${dataCompetencia}. ` +
+      `Disponivel naquela data: ${saldoNaData} — Solicitado: ${quantidade}`
+    );
+  }
+}
+
 // --- ROTAS ---
 
-// Rota Keep-Alive para evitar hibernação no Koyeb (UptimeRobot)
+// Rota Keep-Alive para evitar hibernacao no Koyeb (UptimeRobot)
 app.get('/ping', (req, res) => {
   res.status(200).send('Servidor ativo');
 });
@@ -192,8 +262,8 @@ app.get('/api/produtos', async (req, res) => {
     const params = [];
     
     if (q) {
-        sql += ` WHERE nome ILIKE $1 OR sku ILIKE $1 OR categoria ILIKE $1`;
-        params.push(`%${q}%`);
+      sql += ` WHERE nome ILIKE $1 OR sku ILIKE $1 OR categoria ILIKE $1`;
+      params.push(`%${q}%`);
     }
     
     sql += ` ORDER BY nome ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
@@ -207,158 +277,172 @@ app.get('/api/produtos', async (req, res) => {
 });
 
 app.post('/api/produtos', async (req, res) => {
-    const { nome, descricao, categoria, unidade, quantidade, estoqueMinimo, localArmazenamento, fornecedor, valorUnitario } = req.body;
-    const id = uid();
-    const sku = `PROD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-    
-    try {
-        const { rows } = await pool.query(
-            `INSERT INTO produtos (id, sku, nome, descricao, categoria, unidade, quantidade, estoqueminimo, localarmazenamento, fornecedor, criadoem, valorunitario) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-            [id, sku, nome, descricao, categoria, unidade, quantidade || 0, estoqueMinimo, localArmazenamento, fornecedor, nowISO(), valorUnitario]
-        );
-        res.status(201).json(toCamelCase(rows[0]));
-    } catch (err) { res.status(500).json({ error: err.message }); }
+  const { nome, descricao, categoria, unidade, quantidade, estoqueMinimo, localArmazenamento, fornecedor, valorUnitario } = req.body;
+  const id = uid();
+  const sku = `PROD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+  
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO produtos (id, sku, nome, descricao, categoria, unidade, quantidade, estoqueminimo, localarmazenamento, fornecedor, criadoem, valorunitario) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [id, sku, nome, descricao, categoria, unidade, quantidade || 0, estoqueMinimo, localArmazenamento, fornecedor, nowISO(), valorUnitario]
+    );
+    res.status(201).json(toCamelCase(rows[0]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.patch('/api/produtos/:id', async (req, res) => {
-    const { id } = req.params;
-    const updates = req.body;
-    
-    const fieldMap = {
-        estoqueMinimo: 'estoqueminimo',
-        localArmazenamento: 'localarmazenamento',
-        valorUnitario: 'valorunitario',
-        prioritario: 'prioritario'
-    };
+  const { id } = req.params;
+  const updates = req.body;
+  
+  const fieldMap = {
+    estoqueMinimo: 'estoqueminimo',
+    localArmazenamento: 'localarmazenamento',
+    valorUnitario: 'valorunitario',
+    prioritario: 'prioritario'
+  };
 
-    const fields = Object.keys(updates).map((key, i) => {
-        const dbField = fieldMap[key] || key;
-        return `${dbField} = $${i + 1}`;
-    });
-    
-    if (fields.length === 0) return res.status(400).json({ error: 'Nada para atualizar' });
+  const fields = Object.keys(updates).map((key, i) => {
+    const dbField = fieldMap[key] || key;
+    return `${dbField} = $${i + 1}`;
+  });
+  
+  if (fields.length === 0) return res.status(400).json({ error: 'Nada para atualizar' });
 
-    try {
-        const { rows } = await pool.query(
-            `UPDATE produtos SET ${fields.join(', ')}, atualizadoem = NOW() WHERE id = $${fields.length + 1} RETURNING *`,
-            [...Object.values(updates), id]
-        );
-        res.json(toCamelCase(rows[0]));
-    } catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    const { rows } = await pool.query(
+      `UPDATE produtos SET ${fields.join(', ')}, atualizadoem = NOW() WHERE id = $${fields.length + 1} RETURNING *`,
+      [...Object.values(updates), id]
+    );
+    res.json(toCamelCase(rows[0]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/produtos/:id', async (req, res) => {
-    try {
-        await pool.query('DELETE FROM produtos WHERE id = $1', [req.params.id]);
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    await pool.query('DELETE FROM produtos WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/produtos/valor-total', async (req, res) => {
-    if (req.body.password !== process.env.ADMIN_PASSWORD) return res.status(401).json({ error: 'Senha incorreta' });
-    try {
-        const { rows } = await pool.query('SELECT SUM(quantidade * valorunitario) as total FROM produtos');
-        res.json({ valorTotal: Number(rows[0].total || 0) });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+  if (req.body.password !== process.env.ADMIN_PASSWORD) return res.status(401).json({ error: 'Senha incorreta' });
+  try {
+    const { rows } = await pool.query('SELECT SUM(quantidade * valorunitario) as total FROM produtos');
+    res.json({ valorTotal: Number(rows[0].total || 0) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- ROTA DE MOVIMENTAÇÕES ---
+// --- ROTA DE MOVIMENTACOES ---
 app.get('/api/movimentacoes', async (req, res) => {
-    try {
-        const { rows } = await pool.query('SELECT * FROM movimentacoes ORDER BY criadoem DESC');
-        res.json(rows.map(toCamelCase));
-    } catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    const { rows } = await pool.query('SELECT * FROM movimentacoes ORDER BY criadoem DESC');
+    res.json(rows.map(toCamelCase));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/movimentacoes', async (req, res) => {
-    // Novas propriedades integradas: nomeObra, ordemCompra e custoUnitarioHistorico
-    const { produtoId, tipo, quantidade, motivo, custoEntrada, nomeObra, ordemCompra, custoUnitarioHistorico } = req.body;
-    const client = await pool.connect();
+  const {
+    produtoId, tipo, quantidade, motivo,
+    custoEntrada, nomeObra, ordemCompra, custoUnitarioHistorico,
+    dataCompetencia  // NOVO — formato 'YYYY-MM-DD', opcional (padrao = hoje)
+  } = req.body;
+
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
     
-    try {
-        await client.query('BEGIN');
-        
-        // Bloqueia a linha do produto para garantir cálculo atômico
-        const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
-        const produto = prodRes.rows[0];
-        if (!produto) throw new Error('Produto não encontrado');
+    const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
+    const produto = prodRes.rows[0];
+    if (!produto) throw new Error('Produto nao encontrado');
 
-        let novoSaldo = Number(produto.quantidade);
-        if (tipo === 'ajuste') novoSaldo = Number(quantidade);
-        else novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
-        
-        if (novoSaldo < 0) novoSaldo = 0;
+    // Resolve data de competencia: usa a informada ou hoje
+    const dataCompetenciaFinal = dataCompetencia || hojeISO();
+    const hoje = hojeISO();
+    const isRetroativa = dataCompetenciaFinal < hoje;
 
-        // --- LÓGICA DE CUSTO MÉDIO PONDERADO COM CORREÇÃO RETROATIVA ---
-        let novoValorUnitario = Number(produto.valorunitario);
-
-        if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
-            const qtdAtual = Number(produto.quantidade);
-            let valorAtual = Number(produto.valorunitario || 0); 
-            
-            const qtdEntrada = Number(quantidade);
-            const valorEntrada = Number(custoEntrada);
-
-            // Correção de preço inicial zero com saldo existente
-            if (qtdAtual > 0 && valorAtual === 0) {
-                valorAtual = valorEntrada;
-            }
-
-            const valorTotalEstoque = qtdAtual * valorAtual;
-            const valorTotalNovaEntrada = qtdEntrada * valorEntrada;
-            const novaQuantidadeTotal = qtdAtual + qtdEntrada;
-
-            if (novaQuantidadeTotal > 0) {
-                novoValorUnitario = (valorTotalEstoque + valorTotalNovaEntrada) / novaQuantidadeTotal;
-            } else {
-                novoValorUnitario = valorEntrada;
-            }
-        }
-
-        // Atualiza Produto (Quantidade E Valor Unitário)
-        await client.query(
-            'UPDATE produtos SET quantidade = $1, valorunitario = $2, atualizadoem = NOW() WHERE id = $3', 
-            [novoSaldo, novoValorUnitario, produtoId]
-        );
-        
-        // Registra Movimentação com os novos campos
-        const movId = uid();
-        await client.query(
-            `INSERT INTO movimentacoes 
-             (id, produtoid, tipo, quantidade, motivo, criadoem, nome_obra, ordem_compra, custo_unitario_historico) 
-             VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8)`,
-            [movId, produtoId, tipo, Number(quantidade), motivo, nomeObra || null, ordemCompra || null, custoUnitarioHistorico !== undefined ? Number(custoUnitarioHistorico) : null]
-        );
-
-        if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
-            sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
-        }
-
-        // Busca o produto atualizado para retornar ao front
-        const updatedProd = await client.query('SELECT * FROM produtos WHERE id = $1', [produtoId]);
-        await client.query('COMMIT');
-        
-        res.status(201).json({ 
-            movimentacao: toCamelCase({ 
-                id: movId, 
-                produtoId, 
-                tipo, 
-                quantidade, 
-                motivo, 
-                criadoEm: nowISO(),
-                nome_obra: nomeObra,
-                ordem_compra: ordemCompra,
-                custo_unitario_historico: custoUnitarioHistorico
-            }),
-            produto: toCamelCase(updatedProd.rows[0]) 
-        });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
+    // Saidas retroativas precisam validar se havia saldo suficiente naquela data
+    // Entradas retroativas sao sempre permitidas
+    if (tipo === 'saida' && isRetroativa) {
+      await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
     }
+
+    // Logica de saldo atual — sem alteracao em relacao ao original
+    let novoSaldo = Number(produto.quantidade);
+    if (tipo === 'ajuste') novoSaldo = Number(quantidade);
+    else novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
+    
+    if (novoSaldo < 0) novoSaldo = 0;
+
+    // Custo medio ponderado — sem alteracao em relacao ao original
+    let novoValorUnitario = Number(produto.valorunitario);
+    if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
+      const qtdAtual = Number(produto.quantidade);
+      let valorAtual = Number(produto.valorunitario || 0); 
+      const qtdEntrada = Number(quantidade);
+      const valorEntrada = Number(custoEntrada);
+
+      if (qtdAtual > 0 && valorAtual === 0) valorAtual = valorEntrada;
+
+      const valorTotalEstoque = qtdAtual * valorAtual;
+      const valorTotalNovaEntrada = qtdEntrada * valorEntrada;
+      const novaQuantidadeTotal = qtdAtual + qtdEntrada;
+
+      novoValorUnitario = novaQuantidadeTotal > 0
+        ? (valorTotalEstoque + valorTotalNovaEntrada) / novaQuantidadeTotal
+        : valorEntrada;
+    }
+
+    await client.query(
+      'UPDATE produtos SET quantidade = $1, valorunitario = $2, atualizadoem = NOW() WHERE id = $3', 
+      [novoSaldo, novoValorUnitario, produtoId]
+    );
+    
+    // Registra movimentacao com data_competencia
+    const movId = uid();
+    await client.query(
+      `INSERT INTO movimentacoes 
+         (id, produtoid, tipo, quantidade, motivo, criadoem,
+          data_competencia, nome_obra, ordem_compra, custo_unitario_historico) 
+       VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)`,
+      [
+        movId, produtoId, tipo, Number(quantidade), motivo,
+        dataCompetenciaFinal,
+        nomeObra || null,
+        ordemCompra || null,
+        custoUnitarioHistorico !== undefined ? Number(custoUnitarioHistorico) : null
+      ]
+    );
+
+    if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
+      sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
+    }
+
+    const updatedProd = await client.query('SELECT * FROM produtos WHERE id = $1', [produtoId]);
+    await client.query('COMMIT');
+    
+    res.status(201).json({ 
+      movimentacao: toCamelCase({ 
+        id: movId, 
+        produtoid: produtoId, 
+        tipo, 
+        quantidade, 
+        motivo, 
+        criadoem: nowISO(),
+        data_competencia: dataCompetenciaFinal,
+        nome_obra: nomeObra,
+        ordem_compra: ordemCompra,
+        custo_unitario_historico: custoUnitarioHistorico
+      }),
+      produto: toCamelCase(updatedProd.rows[0]) 
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.delete('/api/movimentacoes/:id', async (req, res) => {
@@ -367,13 +451,13 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     const movResult = await client.query('SELECT * FROM movimentacoes WHERE id = $1', [id]);
-    if (movResult.rowCount === 0) throw new Error('Movimentação não encontrada.');
+    if (movResult.rowCount === 0) throw new Error('Movimentacao nao encontrada.');
     
     const mov = movResult.rows[0];
-    if (mov.tipo === 'ajuste') throw new Error('Não é possível excluir ajuste.');
+    if (mov.tipo === 'ajuste') throw new Error('Nao e possivel excluir ajuste.');
 
     if (mov.entrega_id) {
-        await client.query('DELETE FROM entregas WHERE id = $1', [mov.entrega_id]);
+      await client.query('DELETE FROM entregas WHERE id = $1', [mov.entrega_id]);
     }
 
     const prodResult = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [mov.produtoid]);
@@ -396,81 +480,65 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
 });
 
 app.patch('/api/movimentacoes/:id', async (req, res) => {
-    const { id } = req.params;
-    const { quantidade, motivo } = req.body;
-    const client = await pool.connect();
+  const { id } = req.params;
+  const { quantidade, motivo } = req.body;
+  const client = await pool.connect();
 
-    try {
-        await client.query('BEGIN');
+  try {
+    await client.query('BEGIN');
 
-        const movRes = await client.query('SELECT * FROM movimentacoes WHERE id = $1', [id]);
-        if (movRes.rowCount === 0) throw new Error('Movimentação não encontrada');
-        const movAntiga = movRes.rows[0];
+    const movRes = await client.query('SELECT * FROM movimentacoes WHERE id = $1', [id]);
+    if (movRes.rowCount === 0) throw new Error('Movimentacao nao encontrada');
+    const movAntiga = movRes.rows[0];
 
-        if (movAntiga.tipo === 'ajuste') throw new Error('Use um novo Ajuste para corrigir saldo.');
+    if (movAntiga.tipo === 'ajuste') throw new Error('Use um novo Ajuste para corrigir saldo.');
 
-        const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [movAntiga.produtoid]);
-        const produto = prodRes.rows[0];
+    const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [movAntiga.produtoid]);
+    const produto = prodRes.rows[0];
 
-        let saldoRevertido = Number(produto.quantidade);
-        if (movAntiga.tipo === 'entrada') {
-            saldoRevertido -= Number(movAntiga.quantidade); 
-        } else if (movAntiga.tipo === 'saida') {
-            saldoRevertido += Number(movAntiga.quantidade);
-        }
+    let saldoRevertido = Number(produto.quantidade);
+    if (movAntiga.tipo === 'entrada') saldoRevertido -= Number(movAntiga.quantidade); 
+    else if (movAntiga.tipo === 'saida') saldoRevertido += Number(movAntiga.quantidade);
 
-        let novoSaldoFinal = saldoRevertido;
-        const novaQtd = Number(quantidade);
-        
-        if (movAntiga.tipo === 'entrada') {
-            novoSaldoFinal += novaQtd;
-        } else if (movAntiga.tipo === 'saida') {
-            novoSaldoFinal -= novaQtd;
-        }
+    let novoSaldoFinal = saldoRevertido;
+    const novaQtd = Number(quantidade);
+    
+    if (movAntiga.tipo === 'entrada') novoSaldoFinal += novaQtd;
+    else if (movAntiga.tipo === 'saida') novoSaldoFinal -= novaQtd;
 
-        if (novoSaldoFinal < 0) throw new Error('Estoque ficaria negativo com essa alteração.');
+    if (novoSaldoFinal < 0) throw new Error('Estoque ficaria negativo com essa alteracao.');
 
-        await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldoFinal, produto.id]);
-        
-        const updates = [];
-        const values = [];
-        if (quantidade) {
-            updates.push(`quantidade = $${values.length + 1}`);
-            values.push(novaQtd);
-        }
-        if (motivo) {
-            updates.push(`motivo = $${values.length + 1}`);
-            values.push(motivo);
-        }
-        values.push(id);
+    await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldoFinal, produto.id]);
+    
+    const updates = [];
+    const values = [];
+    if (quantidade) { updates.push(`quantidade = $${values.length + 1}`); values.push(novaQtd); }
+    if (motivo)     { updates.push(`motivo = $${values.length + 1}`);     values.push(motivo); }
+    values.push(id);
 
-        const movUpdateSql = `UPDATE movimentacoes SET ${updates.join(', ')} WHERE id = $${values.length} RETURNING *`;
-        const movUpdatedRes = await client.query(movUpdateSql, values);
+    const movUpdateSql = `UPDATE movimentacoes SET ${updates.join(', ')} WHERE id = $${values.length} RETURNING *`;
+    const movUpdatedRes = await client.query(movUpdateSql, values);
 
-        if (movAntiga.entrega_id && quantidade) {
-            await client.query(
-                'UPDATE entregas SET item_quantidade = $1 WHERE id = $2',
-                [novaQtd, movAntiga.entrega_id]
-            );
-        }
-
-        await client.query('COMMIT');
-
-        const produtoFinal = { ...produto, quantidade: novoSaldoFinal };
-        res.json({
-            movimentacaoAtualizada: toCamelCase(movUpdatedRes.rows[0]),
-            produtoAtualizado: toCamelCase(produtoFinal)
-        });
-
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
+    if (movAntiga.entrega_id && quantidade) {
+      await client.query('UPDATE entregas SET item_quantidade = $1 WHERE id = $2', [novaQtd, movAntiga.entrega_id]);
     }
+
+    await client.query('COMMIT');
+
+    const produtoFinal = { ...produto, quantidade: novoSaldoFinal };
+    res.json({
+      movimentacaoAtualizada: toCamelCase(movUpdatedRes.rows[0]),
+      produtoAtualizado: toCamelCase(produtoFinal)
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-// --- LOGÍSTICA ---
+// --- LOGISTICA ---
 app.get('/api/entregas', async (req, res) => {
   try {
     const sql = `
@@ -481,10 +549,10 @@ app.get('/api/entregas', async (req, res) => {
     `;
     const { rows } = await pool.query(sql);
     const result = rows.map(row => {
-        const formatted = toCamelCase(row);
-        formatted.itemNome = row.item_nome || 'Produto Removido';
-        formatted.sku = row.sku || '-';
-        return formatted;
+      const formatted = toCamelCase(row);
+      formatted.itemNome = row.item_nome || 'Produto Removido';
+      formatted.sku = row.sku || '-';
+      return formatted;
     });
     res.json(result);
   } catch (err) {
@@ -494,11 +562,12 @@ app.get('/api/entregas', async (req, res) => {
 
 app.post('/api/entregas', async (req, res) => {
   const { 
-    dataHoraSolicitacao, localArmazenagem, localObra, produtoId, itemQuantidade, responsavelNome, responsavelTelefone 
+    dataHoraSolicitacao, localArmazenagem, localObra, produtoId,
+    itemQuantidade, responsavelNome, responsavelTelefone 
   } = req.body;
 
   const quantidadeNum = Number(itemQuantidade);
-  if (isNaN(quantidadeNum) || quantidadeNum <= 0) return res.status(400).json({ error: 'Quantidade inválida.' });
+  if (isNaN(quantidadeNum) || quantidadeNum <= 0) return res.status(400).json({ error: 'Quantidade invalida.' });
 
   const client = await pool.connect();
   try {
@@ -507,8 +576,8 @@ app.post('/api/entregas', async (req, res) => {
     const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
     const produto = prodRes.rows[0];
     
-    if (!produto) throw new Error('Produto não encontrado.');
-    if (Number(produto.quantidade) < quantidadeNum) throw new Error(`Estoque insuficiente (${produto.quantidade} disponível).`);
+    if (!produto) throw new Error('Produto nao encontrado.');
+    if (Number(produto.quantidade) < quantidadeNum) throw new Error(`Estoque insuficiente (${produto.quantidade} disponivel).`);
 
     const entregaId = uid();
     await client.query(
@@ -520,15 +589,15 @@ app.post('/api/entregas', async (req, res) => {
     const novoSaldo = Number(produto.quantidade) - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
-    // Grava também na movimentação a obra da entrega
+    // Entrega sempre registra data_competencia = hoje
     await client.query(
-      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, entrega_id, nome_obra)
-       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6)`,
-      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`, entregaId, localObra]
+      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, entrega_id, nome_obra)
+       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6, $7)`,
+      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`, hojeISO(), entregaId, localObra]
     );
 
     if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
-        sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
+      sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
     }
 
     await client.query('COMMIT');
@@ -542,141 +611,132 @@ app.post('/api/entregas', async (req, res) => {
 });
 
 app.put('/api/entregas/:id', async (req, res) => {
-    const { id } = req.params;
-    const { 
-        dataHoraSolicitacao, localArmazenagem, localObra, responsavelNome, responsavelTelefone, status, produtoId, itemQuantidade  
-    } = req.body;
+  const { id } = req.params;
+  const { 
+    dataHoraSolicitacao, localArmazenagem, localObra,
+    responsavelNome, responsavelTelefone, status, produtoId, itemQuantidade  
+  } = req.body;
 
-    const client = await pool.connect();
-    
-    try {
-        await client.query('BEGIN');
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
 
-        const resAntiga = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
-        if (resAntiga.rowCount === 0) throw new Error('Entrega não encontrada');
-        const entregaAntiga = resAntiga.rows[0];
+    const resAntiga = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
+    if (resAntiga.rowCount === 0) throw new Error('Entrega nao encontrada');
+    const entregaAntiga = resAntiga.rows[0];
 
-        const velhoProdutoId = entregaAntiga.produto_id;
-        const velhaQuantidade = Number(entregaAntiga.item_quantidade);
+    const velhoProdutoId = entregaAntiga.produto_id;
+    const velhaQuantidade = Number(entregaAntiga.item_quantidade);
+    const novoProdutoId = produtoId || velhoProdutoId;
+    const novaQuantidade = itemQuantidade ? Number(itemQuantidade) : velhaQuantidade;
 
-        const novoProdutoId = produtoId || velhoProdutoId;
-        const novaQuantidade = itemQuantidade ? Number(itemQuantidade) : velhaQuantidade;
+    if (velhoProdutoId !== novoProdutoId || velhaQuantidade !== novaQuantidade) {
+      await client.query(
+        'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
+        [velhaQuantidade, velhoProdutoId]
+      );
 
-        if (velhoProdutoId !== novoProdutoId || velhaQuantidade !== novaQuantidade) {
-            // Devolver estoque antigo
-            await client.query(
-                'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
-                [velhaQuantidade, velhoProdutoId]
-            );
+      const resProdNovo = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [novoProdutoId]);
+      const prodNovo = resProdNovo.rows[0];
+      if (!prodNovo) throw new Error('Novo produto selecionado nao encontrado.');
+      if (Number(prodNovo.quantidade) < novaQuantidade) throw new Error(`Estoque insuficiente (${prodNovo.quantidade} disponivel).`);
 
-            // Verificar e deduzir novo estoque
-            const resProdNovo = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [novoProdutoId]);
-            const prodNovo = resProdNovo.rows[0];
-            if (!prodNovo) throw new Error('Novo produto selecionado não encontrado.');
-            
-            if (Number(prodNovo.quantidade) < novaQuantidade) {
-                 throw new Error(`Estoque insuficiente (${prodNovo.quantidade} disponível).`);
-            }
+      const novoSaldo = Number(prodNovo.quantidade) - novaQuantidade;
+      await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, novoProdutoId]);
 
-            // Calculando novo saldo para verificação
-            const novoSaldo = Number(prodNovo.quantidade) - novaQuantidade;
+      await client.query(
+        `UPDATE movimentacoes 
+         SET produtoid = $1, quantidade = $2, motivo = $3, nome_obra = $4
+         WHERE entrega_id = $5 AND tipo = 'saida'`,
+        [novoProdutoId, novaQuantidade, `Entrega Editada: ${localObra || entregaAntiga.local_obra}`, localObra || entregaAntiga.local_obra, id]
+      );
 
-            await client.query(
-                'UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2',
-                [novoSaldo, novoProdutoId]
-            );
-
-            // Atualiza a movimentação ligada à entrega
-            await client.query(
-                `UPDATE movimentacoes 
-                 SET produtoid = $1, quantidade = $2, motivo = $3, nome_obra = $4
-                 WHERE entrega_id = $5 AND tipo = 'saida'`,
-                [novoProdutoId, novaQuantidade, `Entrega Editada: ${localObra || entregaAntiga.local_obra}`, localObra || entregaAntiga.local_obra, id]
-            );
-
-            if (prodNovo.estoqueminimo !== null && novoSaldo <= prodNovo.estoqueminimo) {
-                 sendLowStockEmail(toCamelCase({ ...prodNovo, quantidade: novoSaldo }));
-            }
-        }
-
-        const { rows } = await client.query(
-            `UPDATE entregas 
-             SET data_hora_solicitacao = COALESCE($1, data_hora_solicitacao),
-                 local_armazenagem = COALESCE($2, local_armazenagem),
-                 local_obra = COALESCE($3, local_obra),
-                 responsavel_nome = COALESCE($4, responsavel_nome),
-                 responsavel_telefone = COALESCE($5, responsavel_telefone),
-                 status = COALESCE($6, status),
-                 produto_id = $7,
-                 item_quantidade = $8,
-                 item_unidade_medida = (SELECT unidade FROM produtos WHERE id = $7)
-             WHERE id = $9 RETURNING *`,
-            [dataHoraSolicitacao || null, localArmazenagem || null, localObra || null, responsavelNome || null, responsavelTelefone || null, status || null, novoProdutoId, novaQuantidade, id]
-        );
-        
-        await client.query('COMMIT');
-        res.json(toCamelCase(rows[0]));
-
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
+      if (prodNovo.estoqueminimo !== null && novoSaldo <= prodNovo.estoqueminimo) {
+        sendLowStockEmail(toCamelCase({ ...prodNovo, quantidade: novoSaldo }));
+      }
     }
+
+    const { rows } = await client.query(
+      `UPDATE entregas 
+       SET data_hora_solicitacao = COALESCE($1, data_hora_solicitacao),
+           local_armazenagem = COALESCE($2, local_armazenagem),
+           local_obra = COALESCE($3, local_obra),
+           responsavel_nome = COALESCE($4, responsavel_nome),
+           responsavel_telefone = COALESCE($5, responsavel_telefone),
+           status = COALESCE($6, status),
+           produto_id = $7,
+           item_quantidade = $8,
+           item_unidade_medida = (SELECT unidade FROM produtos WHERE id = $7)
+       WHERE id = $9 RETURNING *`,
+      [dataHoraSolicitacao || null, localArmazenagem || null, localObra || null,
+       responsavelNome || null, responsavelTelefone || null, status || null,
+       novoProdutoId, novaQuantidade, id]
+    );
+    
+    await client.query('COMMIT');
+    res.json(toCamelCase(rows[0]));
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.patch('/api/entregas/:id/status', async (req, res) => {
-    try {
-        await pool.query('UPDATE entregas SET status = $1 WHERE id = $2', [req.body.status, req.params.id]);
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    await pool.query('UPDATE entregas SET status = $1 WHERE id = $2', [req.body.status, req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/entregas/:id', async (req, res) => {
-    const { id } = req.params;
-    const client = await pool.connect();
-    
-    try {
-        await client.query('BEGIN');
+  const { id } = req.params;
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
 
-        const resEntrega = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
-        if (resEntrega.rowCount === 0) throw new Error('Entrega não encontrada.');
-        const entrega = resEntrega.rows[0];
-        const quantidadeEstorno = Number(entrega.item_quantidade);
+    const resEntrega = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
+    if (resEntrega.rowCount === 0) throw new Error('Entrega nao encontrada.');
+    const entrega = resEntrega.rows[0];
+    const quantidadeEstorno = Number(entrega.item_quantidade);
 
-        await client.query(
-            'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
-            [quantidadeEstorno, entrega.produto_id]
-        );
+    await client.query(
+      'UPDATE produtos SET quantidade = quantidade + $1, atualizadoem = NOW() WHERE id = $2',
+      [quantidadeEstorno, entrega.produto_id]
+    );
 
-        const motivoEstorno = `Estorno: Entrega excluída (Obra: ${entrega.local_obra})`;
-        await client.query(
-            `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem)
-             VALUES ($1, $2, 'entrada', $3, $4, NOW())`,
-            [uid(), entrega.produto_id, quantidadeEstorno, motivoEstorno]
-        );
+    const motivoEstorno = `Estorno: Entrega excluida (Obra: ${entrega.local_obra})`;
+    // Estorno tambem recebe data_competencia = hoje
+    await client.query(
+      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia)
+       VALUES ($1, $2, 'entrada', $3, $4, NOW(), $5)`,
+      [uid(), entrega.produto_id, quantidadeEstorno, motivoEstorno, hojeISO()]
+    );
 
-        await client.query('DELETE FROM entregas WHERE id = $1', [id]);
+    await client.query('DELETE FROM entregas WHERE id = $1', [id]);
 
-        await client.query('COMMIT');
-        res.json({ success: true, message: 'Entrega excluída e estoque estornado.' });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
-    } finally {
-        client.release();
-    }
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Entrega excluida e estoque estornado.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.get('/api/produtos-lista', async (req, res) => {
-    try {
-        const { rows } = await pool.query("SELECT id, nome FROM produtos");
-        res.json({ message: "success", data: rows });
-    } catch (err) {
-        res.status(400).json({ error: err.message });
-    }
+  try {
+    const { rows } = await pool.query("SELECT id, nome FROM produtos");
+    res.json({ message: "success", data: rows });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
