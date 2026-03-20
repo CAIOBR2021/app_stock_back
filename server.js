@@ -132,8 +132,8 @@ const nowISO = () => new Date().toISOString();
 
 const hojeISO = () => {
   const d = new Date();
-  const offset = d.getTimezoneOffset() * 60000;
-  return new Date(d.getTime() - offset).toISOString().split('T')[0];
+  // 'en-CA' força o formato nativo YYYY-MM-DD e o timeZone fixa no horário de Brasília
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(d);
 };
 
 function toCamelCase(obj) {
@@ -279,13 +279,29 @@ app.post('/api/produtos', async (req, res) => {
   const sku = `PROD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
   
   try {
+    // 1. Cria o produto na tabela "produtos"
     const { rows } = await pool.query(
       `INSERT INTO produtos (id, sku, nome, descricao, categoria, unidade, quantidade, estoqueminimo, localarmazenamento, fornecedor, criadoem, valorunitario) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [id, sku, nome, descricao, categoria, unidade, quantidade || 0, estoqueMinimo, localArmazenamento, fornecedor, nowISO(), valorUnitario]
     );
+
+    // 2. Se o produto foi criado com saldo > 0, cria o histórico em "movimentacoes"
+    const qtdInicial = Number(quantidade) || 0;
+    if (qtdInicial > 0) {
+      await pool.query(
+        `INSERT INTO movimentacoes 
+           (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia) 
+         VALUES ($1, $2, 'ajuste', $3, 'Saldo inicial na criação do produto', NOW(), $4)`,
+        [uid(), id, qtdInicial, hojeISO()]
+      );
+    }
+
+    // 3. Devolve a resposta ao cliente
     res.status(201).json(toCamelCase(rows[0]));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 app.patch('/api/produtos/:id', async (req, res) => {
