@@ -130,23 +130,9 @@ async function updateSchema() {
 const uid = () => crypto.randomUUID();
 const nowISO = () => new Date().toISOString();
 
-/**
- * Retorna a data de hoje no formato YYYY-MM-DD respeitando o fuso horário
- * local do processo Node.js.
- *
- * Por que não usar toISOString().split('T')[0]:
- *   toISOString() sempre retorna a data em UTC. Em servidores hospedados em
- *   UTC (Render, Koyeb, Railway) o offset é zero e não há impacto imediato,
- *   mas se o processo rodar em UTC-3 (máquina local ou servidor configurado
- *   com TZ=America/Sao_Paulo) a versão antiga retornaria o dia anterior entre
- *   00h e 03h, causando falso lançamento retroativo.
- *
- * A versão corrigida subtrai o offset local antes de serializar, garantindo
- * que a data retornada sempre corresponde ao dia civil do fuso do servidor.
- */
 const hojeISO = () => {
   const d = new Date();
-  const offset = d.getTimezoneOffset() * 60000; // offset em ms (positivo para UTC-)
+  const offset = d.getTimezoneOffset() * 60000;
   return new Date(d.getTime() - offset).toISOString().split('T')[0];
 };
 
@@ -188,13 +174,12 @@ function toCamelCase(obj) {
 // Garante que havia saldo suficiente na data informada.
 // Entradas retroativas nunca precisam de validacao.
 async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompetencia) {
-  // Busca o ultimo ajuste ate a data — ponto de partida mais confiavel
   const { rows: ajusteRows } = await client.query(`
     SELECT quantidade, data_competencia, criadoem
     FROM movimentacoes
     WHERE produtoid = $1
       AND tipo = 'ajuste'
-      AND data_competencia <= $2
+      AND COALESCE(data_competencia, criadoem::DATE) <= $2
     ORDER BY data_competencia DESC, criadoem DESC
     LIMIT 1
   `, [produtoId, dataCompetencia]);
@@ -202,7 +187,6 @@ async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompete
   let saldoNaData;
 
   if (ajusteRows.length > 0) {
-    // Tem ajuste: saldo = valor do ajuste + movimentacoes apos o ajuste ate a data
     const ajuste = ajusteRows[0];
     const { rows: posAjuste } = await client.query(`
       SELECT COALESCE(SUM(
@@ -216,15 +200,14 @@ async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompete
       WHERE produtoid = $1
         AND tipo IN ('entrada', 'saida')
         AND (
-          data_competencia > $2
-          OR (data_competencia = $2 AND criadoem > $3)
+          COALESCE(data_competencia, criadoem::DATE) > $2
+          OR (COALESCE(data_competencia, criadoem::DATE) = $2 AND criadoem > $3)
         )
-        AND data_competencia <= $4
+        AND COALESCE(data_competencia, criadoem::DATE) <= $4
     `, [produtoId, ajuste.data_competencia, ajuste.criadoem, dataCompetencia]);
 
     saldoNaData = Number(ajuste.quantidade) + Number(posAjuste[0].delta);
   } else {
-    // Sem ajuste: reconstroi do zero
     const { rows } = await client.query(`
       SELECT COALESCE(SUM(
         CASE tipo
@@ -236,7 +219,7 @@ async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompete
       FROM movimentacoes
       WHERE produtoid = $1
         AND tipo IN ('entrada', 'saida')
-        AND data_competencia <= $2
+        AND COALESCE(data_competencia, criadoem::DATE) <= $2
     `, [produtoId, dataCompetencia]);
 
     saldoNaData = Number(rows[0].saldo);
@@ -252,7 +235,6 @@ async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompete
 
 // --- ROTAS ---
 
-// Rota Keep-Alive para evitar hibernacao no Koyeb (UptimeRobot)
 app.get('/ping', (req, res) => {
   res.status(200).send('Servidor ativo');
 });
@@ -360,7 +342,7 @@ app.post('/api/movimentacoes', async (req, res) => {
   const {
     produtoId, tipo, quantidade, motivo,
     custoEntrada, nomeObra, ordemCompra, custoUnitarioHistorico,
-    dataCompetencia  // formato 'YYYY-MM-DD', opcional (padrao = hoje no fuso local)
+    dataCompetencia
   } = req.body;
 
   const client = await pool.connect();
@@ -372,15 +354,21 @@ app.post('/api/movimentacoes', async (req, res) => {
     const produto = prodRes.rows[0];
     if (!produto) throw new Error('Produto nao encontrado');
 
-    // Resolve data de competencia: usa a informada ou hoje (fuso local corrigido)
     const dataCompetenciaFinal = dataCompetencia || hojeISO();
     const hoje = hojeISO();
     const isRetroativa = dataCompetenciaFinal < hoje;
 
-    // Saidas retroativas precisam validar se havia saldo suficiente naquela data.
-    // Entradas retroativas sao sempre permitidas.
-    if (tipo === 'saida' && isRetroativa) {
-      await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
+    // ── CORREÇÃO: saídas usam saldo atual para hoje, histórico só para datas passadas ──
+    if (tipo === 'saida') {
+      if (isRetroativa) {
+        await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
+      } else {
+        if (Number(produto.quantidade) < Number(quantidade)) {
+          throw new Error(
+            `Estoque insuficiente. Disponivel: ${produto.quantidade} — Solicitado: ${quantidade}`
+          );
+        }
+      }
     }
 
     // Logica de saldo atual
@@ -414,7 +402,6 @@ app.post('/api/movimentacoes', async (req, res) => {
       [novoSaldo, novoValorUnitario, produtoId]
     );
     
-    // Registra movimentacao com data_competencia
     const movId = uid();
     await client.query(
       `INSERT INTO movimentacoes 
@@ -604,7 +591,6 @@ app.post('/api/entregas', async (req, res) => {
     const novoSaldo = Number(produto.quantidade) - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
-    // Entrega registra data_competencia = hoje (fuso local corrigido)
     await client.query(
       `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, entrega_id, nome_obra)
        VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6, $7)`,
@@ -724,7 +710,6 @@ app.delete('/api/entregas/:id', async (req, res) => {
     );
 
     const motivoEstorno = `Estorno: Entrega excluida (Obra: ${entrega.local_obra})`;
-    // Estorno recebe data_competencia = hoje (fuso local corrigido)
     await client.query(
       `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia)
        VALUES ($1, $2, 'entrada', $3, $4, NOW(), $5)`,
