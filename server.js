@@ -374,6 +374,11 @@ app.post('/api/movimentacoes', async (req, res) => {
     const hoje = hojeISO();
     const isRetroativa = dataCompetenciaFinal < hoje;
 
+    // CORREÇÃO 2: Impedir o ajuste absoluto com data no passado
+    if (tipo === 'ajuste' && isRetroativa) {
+      throw new Error('Não é permitido lançar Ajuste de Estoque retroativo. O ajuste deve refletir a contagem física atual.');
+    }
+
     // ── CORREÇÃO: saídas usam saldo atual para hoje, histórico só para datas passadas ──
     if (tipo === 'saida') {
       if (isRetroativa) {
