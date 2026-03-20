@@ -104,7 +104,6 @@ async function updateSchema() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN 
           ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2); 
         END IF;
-        -- MUDANCA 1: coluna para data de competencia (suporte a retroativos)
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='data_competencia') THEN 
           ALTER TABLE movimentacoes ADD COLUMN data_competencia DATE;
           UPDATE movimentacoes SET data_competencia = criadoem::DATE WHERE data_competencia IS NULL;
@@ -131,8 +130,25 @@ async function updateSchema() {
 const uid = () => crypto.randomUUID();
 const nowISO = () => new Date().toISOString();
 
-// MUDANCA 2: helper para data de hoje no formato YYYY-MM-DD
-const hojeISO = () => new Date().toISOString().split('T')[0];
+/**
+ * Retorna a data de hoje no formato YYYY-MM-DD respeitando o fuso horário
+ * local do processo Node.js.
+ *
+ * Por que não usar toISOString().split('T')[0]:
+ *   toISOString() sempre retorna a data em UTC. Em servidores hospedados em
+ *   UTC (Render, Koyeb, Railway) o offset é zero e não há impacto imediato,
+ *   mas se o processo rodar em UTC-3 (máquina local ou servidor configurado
+ *   com TZ=America/Sao_Paulo) a versão antiga retornaria o dia anterior entre
+ *   00h e 03h, causando falso lançamento retroativo.
+ *
+ * A versão corrigida subtrai o offset local antes de serializar, garantindo
+ * que a data retornada sempre corresponde ao dia civil do fuso do servidor.
+ */
+const hojeISO = () => {
+  const d = new Date();
+  const offset = d.getTimezoneOffset() * 60000; // offset em ms (positivo para UTC-)
+  return new Date(d.getTime() - offset).toISOString().split('T')[0];
+};
 
 function toCamelCase(obj) {
   if (!obj) return obj;
@@ -158,7 +174,7 @@ function toCamelCase(obj) {
     else if (key === 'nome_obra') camelKey = 'nomeObra';
     else if (key === 'ordem_compra') camelKey = 'ordemCompra';
     else if (key === 'custo_unitario_historico') camelKey = 'custoUnitarioHistorico';
-    else if (key === 'data_competencia') camelKey = 'dataCompetencia'; // NOVO
+    else if (key === 'data_competencia') camelKey = 'dataCompetencia';
     
     if (['quantidade', 'valorUnitario', 'itemQuantidade', 'valorTotal', 'custoUnitarioHistorico'].includes(camelKey) && obj[key] !== null) {
       newObj[camelKey] = Number(obj[key]);
@@ -169,7 +185,6 @@ function toCamelCase(obj) {
   return newObj;
 }
 
-// MUDANCA 3: validacao de saida retroativa
 // Garante que havia saldo suficiente na data informada.
 // Entradas retroativas nunca precisam de validacao.
 async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompetencia) {
@@ -345,7 +360,7 @@ app.post('/api/movimentacoes', async (req, res) => {
   const {
     produtoId, tipo, quantidade, motivo,
     custoEntrada, nomeObra, ordemCompra, custoUnitarioHistorico,
-    dataCompetencia  // NOVO — formato 'YYYY-MM-DD', opcional (padrao = hoje)
+    dataCompetencia  // formato 'YYYY-MM-DD', opcional (padrao = hoje no fuso local)
   } = req.body;
 
   const client = await pool.connect();
@@ -357,25 +372,25 @@ app.post('/api/movimentacoes', async (req, res) => {
     const produto = prodRes.rows[0];
     if (!produto) throw new Error('Produto nao encontrado');
 
-    // Resolve data de competencia: usa a informada ou hoje
+    // Resolve data de competencia: usa a informada ou hoje (fuso local corrigido)
     const dataCompetenciaFinal = dataCompetencia || hojeISO();
     const hoje = hojeISO();
     const isRetroativa = dataCompetenciaFinal < hoje;
 
-    // Saidas retroativas precisam validar se havia saldo suficiente naquela data
-    // Entradas retroativas sao sempre permitidas
+    // Saidas retroativas precisam validar se havia saldo suficiente naquela data.
+    // Entradas retroativas sao sempre permitidas.
     if (tipo === 'saida' && isRetroativa) {
       await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
     }
 
-    // Logica de saldo atual — sem alteracao em relacao ao original
+    // Logica de saldo atual
     let novoSaldo = Number(produto.quantidade);
     if (tipo === 'ajuste') novoSaldo = Number(quantidade);
     else novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
     
     if (novoSaldo < 0) novoSaldo = 0;
 
-    // Custo medio ponderado — sem alteracao em relacao ao original
+    // Custo medio ponderado
     let novoValorUnitario = Number(produto.valorunitario);
     if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
       const qtdAtual = Number(produto.quantidade);
@@ -589,7 +604,7 @@ app.post('/api/entregas', async (req, res) => {
     const novoSaldo = Number(produto.quantidade) - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
-    // Entrega sempre registra data_competencia = hoje
+    // Entrega registra data_competencia = hoje (fuso local corrigido)
     await client.query(
       `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, entrega_id, nome_obra)
        VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6, $7)`,
@@ -709,7 +724,7 @@ app.delete('/api/entregas/:id', async (req, res) => {
     );
 
     const motivoEstorno = `Estorno: Entrega excluida (Obra: ${entrega.local_obra})`;
-    // Estorno tambem recebe data_competencia = hoje
+    // Estorno recebe data_competencia = hoje (fuso local corrigido)
     await client.query(
       `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia)
        VALUES ($1, $2, 'entrada', $3, $4, NOW(), $5)`,
