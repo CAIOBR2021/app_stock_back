@@ -617,10 +617,13 @@ app.post('/api/entregas', async (req, res) => {
     const novoSaldo = Number(produto.quantidade) - quantidadeNum;
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, produtoId]);
 
+    // Extrai apenas a parte "YYYY-MM-DD" da data futura agendada
+    const dataFutura = dataHoraSolicitacao.split('T')[0];
+
     await client.query(
       `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, entrega_id, nome_obra)
        VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6, $7)`,
-      [uid(), produtoId, quantidadeNum, `Entrega para: ${localObra}`, hojeISO(), entregaId, localObra]
+      [uid(), produtoId, quantidadeNum, `Entrega Agendada: ${localObra}`, dataFutura, entregaId, localObra]
     );
 
     if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
