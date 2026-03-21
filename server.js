@@ -178,7 +178,7 @@ async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompete
     SELECT quantidade, data_competencia, criadoem
     FROM movimentacoes
     WHERE produtoid = $1
-      AND tipo = 'ajuste'
+      AND tipo IN ('ajuste', 'saldo_inicial')
       AND COALESCE(data_competencia, criadoem::DATE) <= $2
     ORDER BY data_competencia DESC, criadoem DESC
     LIMIT 1
@@ -286,13 +286,13 @@ app.post('/api/produtos', async (req, res) => {
       [id, sku, nome, descricao, categoria, unidade, quantidade || 0, estoqueMinimo, localArmazenamento, fornecedor, nowISO(), valorUnitario]
     );
 
-    // 2. Se o produto foi criado com saldo > 0, cria o histórico em "movimentacoes"
+    // 2. Se o produto foi criado com saldo > 0, cria o histórico em "movimentacoes" (Agora como saldo_inicial)
     const qtdInicial = Number(quantidade) || 0;
     if (qtdInicial > 0) {
       await pool.query(
         `INSERT INTO movimentacoes 
            (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia) 
-         VALUES ($1, $2, 'ajuste', $3, 'Saldo inicial na criação do produto', NOW(), $4)`,
+         VALUES ($1, $2, 'saldo_inicial', $3, 'Saldo inicial na criação do produto', NOW(), $4)`,
         [uid(), id, qtdInicial, hojeISO()]
       );
     }
@@ -379,9 +379,9 @@ app.post('/api/movimentacoes', async (req, res) => {
     const hoje = hojeISO();
     const isRetroativa = dataCompetenciaFinal < hoje;
 
-    // CORREÇÃO 2: Impedir o ajuste absoluto com data no passado
-    if (tipo === 'ajuste' && isRetroativa) {
-      throw new Error('Não é permitido lançar Ajuste de Estoque retroativo. O ajuste deve refletir a contagem física atual.');
+    // CORREÇÃO 2: Impedir o ajuste ou saldo inicial com data no passado
+    if ((tipo === 'ajuste' || tipo === 'saldo_inicial') && isRetroativa) {
+      throw new Error(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo. Ele deve refletir a contagem física atual.`);
     }
 
     // ── CORREÇÃO: saídas usam saldo atual para hoje, histórico só para datas passadas ──
@@ -397,10 +397,13 @@ app.post('/api/movimentacoes', async (req, res) => {
       }
     }
 
-    // Logica de saldo atual
+    // Logica de saldo atual (INCLUINDO O SALDO_INICIAL AQUI)
     let novoSaldo = Number(produto.quantidade);
-    if (tipo === 'ajuste') novoSaldo = Number(quantidade);
-    else novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
+    if (tipo === 'ajuste' || tipo === 'saldo_inicial') {
+      novoSaldo = Number(quantidade);
+    } else {
+      novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
+    }
     
     if (novoSaldo < 0) novoSaldo = 0;
 
@@ -482,7 +485,9 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
     if (movResult.rowCount === 0) throw new Error('Movimentacao nao encontrada.');
     
     const mov = movResult.rows[0];
-    if (mov.tipo === 'ajuste') throw new Error('Nao e possivel excluir ajuste.');
+    if (mov.tipo === 'ajuste' || mov.tipo === 'saldo_inicial') {
+      throw new Error(`Não é possível excluir ${mov.tipo === 'ajuste' ? 'um ajuste' : 'um saldo inicial'}.`);
+    }
 
     if (mov.entrega_id) {
       await client.query('DELETE FROM entregas WHERE id = $1', [mov.entrega_id]);
@@ -519,7 +524,9 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
     if (movRes.rowCount === 0) throw new Error('Movimentacao nao encontrada');
     const movAntiga = movRes.rows[0];
 
-    if (movAntiga.tipo === 'ajuste') throw new Error('Use um novo Ajuste para corrigir saldo.');
+    if (movAntiga.tipo === 'ajuste' || movAntiga.tipo === 'saldo_inicial') {
+      throw new Error('Use um novo Ajuste ou Entrada/Saída para corrigir o saldo atual.');
+    }
 
     const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [movAntiga.produtoid]);
     const produto = prodRes.rows[0];
