@@ -349,7 +349,12 @@ app.post('/api/produtos/valor-total', async (req, res) => {
 // --- ROTA DE MOVIMENTACOES ---
 app.get('/api/movimentacoes', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM movimentacoes ORDER BY criadoem DESC');
+    // CORREÇÃO: Ordenar primeiro pela data do acontecimento (competência)
+    // Se houver mais de um lançamento no mesmo dia, o mais recente digitado fica no topo
+    const { rows } = await pool.query(`
+      SELECT * FROM movimentacoes 
+      ORDER BY COALESCE(data_competencia, criadoem::DATE) DESC, criadoem DESC
+    `);
     res.json(rows.map(toCamelCase));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
