@@ -2,7 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-require('dotenv').config();
+
+require('dotenv').config({ override: false });
 
 const { sendLowStockEmail } = require('./services/emailService'); 
 
