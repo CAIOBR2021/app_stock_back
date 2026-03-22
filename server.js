@@ -3,7 +3,8 @@ const cors = require('cors');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
-require('dotenv').config({ override: false });
+// REMOVA ou comente esta linha:
+// require('dotenv').config({ override: false });
 
 console.log('DATABASE_URL:', process.env.DATABASE_URL ? process.env.DATABASE_URL.substring(0, 50) + '...' : 'NÃO DEFINIDA');
 
