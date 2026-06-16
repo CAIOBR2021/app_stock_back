@@ -21,9 +21,9 @@ app.use(express.json());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20, 
+  max: 50,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  connectionTimeoutMillis: 10000,
 });
 
 pool.connect().then(() => {
@@ -472,6 +472,106 @@ app.post('/api/movimentacoes', async (req, res) => {
       }),
       produto: toCamelCase(updatedProd.rows[0]) 
     });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// --- ROTA DE MOVIMENTAÇÕES EM LOTE ---
+app.post('/api/movimentacoes/lote', async (req, res) => {
+  const { itens, tipo, motivo, nomeObra, ordemCompra, dataCompetencia } = req.body;
+
+  if (!Array.isArray(itens) || itens.length === 0) {
+    return res.status(400).json({ error: 'Lista de itens é obrigatória.' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const resultados = [];
+    const dataCompetenciaFinal = dataCompetencia || hojeISO();
+    const hoje = hojeISO();
+    const isRetroativa = dataCompetenciaFinal < hoje;
+
+    if ((tipo === 'ajuste' || tipo === 'saldo_inicial') && isRetroativa) {
+      throw new Error(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo.`);
+    }
+
+    for (const item of itens) {
+      const { produtoId, quantidade, valorUnitario } = item;
+
+      const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
+      const produto = prodRes.rows[0];
+      if (!produto) throw new Error(`Produto ${produtoId} não encontrado.`);
+
+      if (tipo === 'saida') {
+        if (isRetroativa) {
+          await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
+        } else if (Number(produto.quantidade) < Number(quantidade)) {
+          throw new Error(
+            `Estoque insuficiente para "${produto.nome}". Disponível: ${produto.quantidade} — Solicitado: ${quantidade}`
+          );
+        }
+      }
+
+      let novoSaldo = Number(produto.quantidade);
+      if (tipo === 'ajuste' || tipo === 'saldo_inicial') {
+        novoSaldo = Number(quantidade);
+      } else {
+        novoSaldo += (tipo === 'entrada' ? 1 : -1) * Number(quantidade);
+      }
+      if (novoSaldo < 0) novoSaldo = 0;
+
+      let novoValorUnitario = Number(produto.valorunitario);
+      const custoEntrada = valorUnitario;
+      if (tipo === 'entrada' && custoEntrada !== undefined && custoEntrada !== null) {
+        const qtdAtual = Number(produto.quantidade);
+        let valorAtual = Number(produto.valorunitario || 0);
+        const qtdEntrada = Number(quantidade);
+        const valorEntrada = Number(custoEntrada);
+        if (qtdAtual > 0 && valorAtual === 0) valorAtual = valorEntrada;
+        const valorTotalEstoque = qtdAtual * valorAtual;
+        const valorTotalNovaEntrada = qtdEntrada * valorEntrada;
+        const novaQuantidadeTotal = qtdAtual + qtdEntrada;
+        novoValorUnitario = novaQuantidadeTotal > 0
+          ? (valorTotalEstoque + valorTotalNovaEntrada) / novaQuantidadeTotal
+          : valorEntrada;
+      }
+
+      await client.query(
+        'UPDATE produtos SET quantidade = $1, valorunitario = $2, atualizadoem = NOW() WHERE id = $3',
+        [novoSaldo, novoValorUnitario, produtoId]
+      );
+
+      const movId = uid();
+      await client.query(
+        `INSERT INTO movimentacoes
+           (id, produtoid, tipo, quantidade, motivo, criadoem,
+            data_competencia, nome_obra, ordem_compra, custo_unitario_historico)
+         VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)`,
+        [
+          movId, produtoId, tipo, Number(quantidade), motivo,
+          dataCompetenciaFinal,
+          nomeObra || null,
+          ordemCompra || null,
+          valorUnitario !== undefined ? Number(valorUnitario) : null
+        ]
+      );
+
+      if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
+        sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
+      }
+
+      resultados.push({ produtoId, movId, novoSaldo });
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ sucesso: true, total: resultados.length, resultados });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
