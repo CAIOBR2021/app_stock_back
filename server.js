@@ -122,6 +122,9 @@ async function updateSchema() {
       CREATE INDEX IF NOT EXISTS idx_entregas_data ON entregas(data_hora_solicitacao DESC);
       CREATE INDEX IF NOT EXISTS idx_movimentacoes_produto_data_competencia
         ON movimentacoes(produtoid, data_competencia DESC, criadoem DESC);
+      CREATE INDEX IF NOT EXISTS idx_entregas_status ON entregas(status);
+      CREATE INDEX IF NOT EXISTS idx_movimentacoes_tipo ON movimentacoes(tipo);
+      CREATE INDEX IF NOT EXISTS idx_entregas_produto_id ON entregas(produto_id);
     `);
 
     console.log('Schema atualizado com sucesso (novas colunas e indices de performance aplicados).');
@@ -353,12 +356,13 @@ app.post('/api/produtos/valor-total', async (req, res) => {
 // --- ROTA DE MOVIMENTACOES ---
 app.get('/api/movimentacoes', async (req, res) => {
   try {
-    // CORREÇÃO: Ordenar primeiro pela data do acontecimento (competência)
-    // Se houver mais de um lançamento no mesmo dia, o mais recente digitado fica no topo
+    const limit = Math.min(parseInt(req.query._limit) || 5000, 10000);
+    const offset = parseInt(req.query._offset) || 0;
     const { rows } = await pool.query(`
-      SELECT * FROM movimentacoes 
+      SELECT * FROM movimentacoes
       ORDER BY COALESCE(data_competencia, criadoem::DATE) DESC, criadoem DESC
-    `);
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
     res.json(rows.map(toCamelCase));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -502,11 +506,18 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
       throw new Error(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo.`);
     }
 
+    const produtoIds = itens.map(i => i.produtoId);
+    const placeholders = produtoIds.map((_, i) => `$${i + 1}`).join(', ');
+    const { rows: produtosRows } = await client.query(
+      `SELECT * FROM produtos WHERE id IN (${placeholders}) FOR UPDATE`,
+      produtoIds
+    );
+    const produtoMap = new Map(produtosRows.map(p => [p.id, p]));
+
     for (const item of itens) {
       const { produtoId, quantidade, valorUnitario } = item;
 
-      const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
-      const produto = prodRes.rows[0];
+      const produto = produtoMap.get(produtoId);
       if (!produto) throw new Error(`Produto ${produtoId} não encontrado.`);
 
       if (tipo === 'saida') {
@@ -548,6 +559,8 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
         [novoSaldo, novoValorUnitario, produtoId]
       );
 
+      produto.quantidade = novoSaldo;
+
       const movId = uid();
       await client.query(
         `INSERT INTO movimentacoes
@@ -567,7 +580,7 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
         sendLowStockEmail(toCamelCase({ ...produto, quantidade: novoSaldo }));
       }
 
-      resultados.push({ produtoId, movId, novoSaldo });
+      resultados.push({ produtoId, movId, novoSaldo, novoValorUnitario });
     }
 
     await client.query('COMMIT');
@@ -680,13 +693,16 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
 // --- LOGISTICA ---
 app.get('/api/entregas', async (req, res) => {
   try {
+    const limit = Math.min(parseInt(req.query._limit) || 5000, 10000);
+    const offset = parseInt(req.query._offset) || 0;
     const sql = `
-      SELECT e.*, p.nome as item_nome, p.sku 
+      SELECT e.*, p.nome as item_nome, p.sku
       FROM entregas e
       LEFT JOIN produtos p ON e.produto_id = p.id
       ORDER BY e.data_hora_solicitacao DESC
+      LIMIT $1 OFFSET $2
     `;
-    const { rows } = await pool.query(sql);
+    const { rows } = await pool.query(sql, [limit, offset]);
     const result = rows.map(row => {
       const formatted = toCamelCase(row);
       formatted.itemNome = row.item_nome || 'Produto Removido';
@@ -829,6 +845,21 @@ app.patch('/api/entregas/:id/status', async (req, res) => {
   try {
     await pool.query('UPDATE entregas SET status = $1 WHERE id = $2', [req.body.status, req.params.id]);
     res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/entregas/status/lote', async (req, res) => {
+  const { ids, status } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0 || !status) {
+    return res.status(400).json({ error: 'ids (array) e status são obrigatórios.' });
+  }
+  try {
+    const placeholders = ids.map((_, i) => `$${i + 2}`).join(', ');
+    const { rowCount } = await pool.query(
+      `UPDATE entregas SET status = $1 WHERE id IN (${placeholders})`,
+      [status, ...ids]
+    );
+    res.json({ success: true, updated: rowCount });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
