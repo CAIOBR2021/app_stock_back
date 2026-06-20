@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 // --- BANCO DE DADOS ---
 const pool = new Pool({
@@ -905,6 +905,95 @@ app.get('/api/produtos-lista', async (req, res) => {
     res.json({ message: "success", data: rows });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+// --- LEITURA DE NOTA FISCAL (OCR + GEMINI) ---
+const NF_PROMPT = `Você é um especialista em leitura de notas fiscais brasileiras (NF-e, NFS-e, cupom fiscal, DANFE).
+
+Analise a imagem da nota fiscal e extraia TODOS os itens/produtos listados.
+
+Para cada item, retorne:
+- nome: nome do produto/material exatamente como aparece
+- quantidade: quantidade numérica
+- unidade: unidade de medida (UN, KG, M, M2, M3, L, PCT, CX, etc.)
+- valorUnitario: valor unitário em reais (número decimal)
+
+Também extraia, se disponível:
+- numeroNF: número da nota fiscal
+- ordemCompra: número da ordem de compra / pedido de compra (procure por campos como "OC", "Ordem de Compra", "Pedido", "Pedido de Compra", "Nº Pedido", "PO", "Purchase Order" ou similares)
+- nomeObra: nome da obra, projeto ou local de destino (procure por campos como "Obra", "Nome da Obra", "Local", "Projeto", "Destino", "Centro de Custo", "Filial", "Unidade", "Canteiro" ou similares)
+- fornecedor: nome do fornecedor/emitente
+- dataEmissao: data de emissão (formato YYYY-MM-DD)
+
+Responda APENAS com JSON válido neste formato exato, sem markdown:
+{
+  "numeroNF": "string ou null",
+  "ordemCompra": "string ou null",
+  "nomeObra": "string ou null",
+  "fornecedor": "string ou null",
+  "dataEmissao": "string ou null",
+  "itens": [
+    {
+      "nome": "string",
+      "quantidade": number,
+      "unidade": "string",
+      "valorUnitario": number
+    }
+  ]
+}
+
+Se não conseguir identificar algum campo, use null. Se não conseguir ler a imagem ou não for uma nota fiscal, retorne: {"erro": "mensagem explicativa"}`;
+
+app.post('/api/nota-fiscal/ler', async (req, res) => {
+  const { imageBase64, mimeType } = req.body;
+
+  if (!imageBase64) {
+    return res.status(400).json({ error: 'imageBase64 é obrigatório.' });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY não configurada no servidor.' });
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: NF_PROMPT },
+              { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
+            ],
+          }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const errBody = await response.json().catch(() => ({}));
+      throw new Error(errBody?.error?.message || `Erro na API Gemini (${response.status})`);
+    }
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error('Resposta vazia da IA.');
+
+    const jsonStr = text.replace(/```json?\s*/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(jsonStr);
+
+    if (parsed.erro) {
+      return res.status(422).json({ error: parsed.erro });
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
