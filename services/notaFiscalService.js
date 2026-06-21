@@ -1,18 +1,18 @@
-const NF_PROMPT = `Você é um especialista em leitura de notas fiscais brasileiras (NF-e, NFS-e, cupom fiscal, DANFE).
+const NF_PROMPT = `Você é um especialista em leitura de documentos comerciais brasileiros (notas fiscais NF-e, NFS-e, DANFE, cupom fiscal, ordens de compra, pedidos de compra, requisições de material, e qualquer outro documento que liste produtos/materiais).
 
-Analise a imagem da nota fiscal e extraia TODOS os itens/produtos listados.
+Analise o documento fornecido e extraia TODOS os itens/produtos listados, independentemente do tipo de documento.
 
 Para cada item, retorne:
 - nome: nome do produto/material exatamente como aparece
 - quantidade: quantidade numérica
 - unidade: unidade de medida (UN, KG, M, M2, M3, L, PCT, CX, etc.)
-- valorUnitario: valor unitário em reais (número decimal)
+- valorUnitario: valor unitário em reais (número decimal). Se não houver valor, use 0
 
 Também extraia, se disponível, aplicando RIGOROSAMENTE as regras de formatação:
-- numeroNF: número da nota fiscal (remova zeros à esquerda. Ex: 00012345 → 12345)
+- numeroNF: número do documento/nota fiscal (remova zeros à esquerda. Ex: 00012345 → 12345)
 - ordemCompra: número da ordem de compra / pedido de compra (procure por campos como "OC", "Ordem de Compra", "Pedido", "Pedido de Compra", "Nº Pedido", "PO", "Purchase Order" ou similares). REMOVA todos os zeros à esquerda (Ex: 000003331 → 3331)
 - nomeObra: nome da obra, projeto ou local de destino. Procure PRINCIPALMENTE no campo de Observações por nomes como "PEDIDO CCEAM", "Obra X", etc. Também procure em campos como "Obra", "Nome da Obra", "Local", "Projeto", "Destino", "Centro de Custo", "Filial", "Unidade", "Canteiro". Extraia apenas o nome limpo (Ex: se nas observações constar "PEDIDO CCEAM", retorne "CCEAM")
-- fornecedor: nome do fornecedor/emitente. REMOVA quaisquer números/códigos que apareçam ANTES do nome (Ex: "0003044VIX ARTEFATOS DE CONCRETO LTDA" → "VIX ARTEFATOS DE CONCRETO LTDA", "00154 Construtora Exemplo" → "Construtora Exemplo")
+- fornecedor: nome do fornecedor/emitente. REMOVA quaisquer números que apareçam ANTES do nome (Ex: "0003044VIX ARTEFATOS DE CONCRETO LTDA" → "VIX ARTEFATOS DE CONCRETO LTDA", "00154 Construtora Exemplo" → "Construtora Exemplo")
 - dataEmissao: data de emissão (formato YYYY-MM-DD)
 
 Responda APENAS com JSON válido neste formato exato, sem markdown:
@@ -32,7 +32,7 @@ Responda APENAS com JSON válido neste formato exato, sem markdown:
   ]
 }
 
-Se não conseguir identificar algum campo, use null. Se não conseguir ler a imagem ou não for uma nota fiscal, retorne: {"erro": "mensagem explicativa"}`;
+Se não conseguir identificar algum campo, use null. Se não conseguir ler o documento, retorne: {"erro": "mensagem explicativa"}`;
 
 async function analisarNotaFiscal(imageBase64, mimeType) {
   const apiKey = process.env.GEMINI_API_KEY;
