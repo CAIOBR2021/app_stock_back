@@ -110,9 +110,12 @@ async function updateSchema() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN 
           ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2); 
         END IF;
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='data_competencia') THEN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='data_competencia') THEN
           ALTER TABLE movimentacoes ADD COLUMN data_competencia DATE;
           UPDATE movimentacoes SET data_competencia = criadoem::DATE WHERE data_competencia IS NULL;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='produtos' AND column_name='conversoes') THEN
+          ALTER TABLE produtos ADD COLUMN conversoes JSONB DEFAULT '[]';
         END IF;
       END $$;
     `);
@@ -283,16 +286,15 @@ app.get('/api/produtos', async (req, res) => {
 });
 
 app.post('/api/produtos', async (req, res) => {
-  const { nome, descricao, categoria, unidade, quantidade, estoqueMinimo, localArmazenamento, fornecedor, valorUnitario } = req.body;
+  const { nome, descricao, categoria, unidade, quantidade, estoqueMinimo, localArmazenamento, fornecedor, valorUnitario, conversoes } = req.body;
   const id = uid();
   const sku = `PROD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-  
+
   try {
-    // 1. Cria o produto na tabela "produtos"
     const { rows } = await pool.query(
-      `INSERT INTO produtos (id, sku, nome, descricao, categoria, unidade, quantidade, estoqueminimo, localarmazenamento, fornecedor, criadoem, valorunitario) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-      [id, sku, nome, descricao, categoria, unidade, quantidade || 0, estoqueMinimo, localArmazenamento, fornecedor, nowISO(), valorUnitario]
+      `INSERT INTO produtos (id, sku, nome, descricao, categoria, unidade, quantidade, estoqueminimo, localarmazenamento, fornecedor, criadoem, valorunitario, conversoes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+      [id, sku, nome, descricao, categoria, unidade, quantidade || 0, estoqueMinimo, localArmazenamento, fornecedor, nowISO(), valorUnitario, JSON.stringify(conversoes || [])]
     );
 
     // 2. Se o produto foi criado com saldo > 0, cria o histórico em "movimentacoes" (Agora como saldo_inicial)
@@ -321,14 +323,19 @@ app.patch('/api/produtos/:id', async (req, res) => {
     estoqueMinimo: 'estoqueminimo',
     localArmazenamento: 'localarmazenamento',
     valorUnitario: 'valorunitario',
-    prioritario: 'prioritario'
+    prioritario: 'prioritario',
+    conversoes: 'conversoes'
   };
+
+  if (updates.conversoes !== undefined) {
+    updates.conversoes = JSON.stringify(updates.conversoes);
+  }
 
   const fields = Object.keys(updates).map((key, i) => {
     const dbField = fieldMap[key] || key;
     return `${dbField} = $${i + 1}`;
   });
-  
+
   if (fields.length === 0) return res.status(400).json({ error: 'Nada para atualizar' });
 
   try {
