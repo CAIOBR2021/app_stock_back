@@ -52,7 +52,7 @@ async function analisarNotaFiscal(imageBase64, mimeType) {
             { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
           ],
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 4096 },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 65536 },
       }),
     },
   );
@@ -67,7 +67,31 @@ async function analisarNotaFiscal(imageBase64, mimeType) {
   if (!text) throw new Error('Resposta vazia da IA.');
 
   const jsonStr = text.replace(/```json?\s*/g, '').replace(/```/g, '').trim();
-  const parsed = JSON.parse(jsonStr);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (parseErr) {
+    // JSON truncado — tenta recuperar fechando arrays/objetos abertos
+    let fixed = jsonStr;
+
+    // Remove o último item incompleto (após a última vírgula dentro do array)
+    const lastCompleteItem = fixed.lastIndexOf('},');
+    if (lastCompleteItem !== -1) {
+      fixed = fixed.substring(0, lastCompleteItem + 1);
+    }
+
+    // Fecha array e objeto se necessário
+    if (!fixed.includes(']}')) {
+      fixed += ']}';
+    }
+
+    try {
+      parsed = JSON.parse(fixed);
+    } catch {
+      throw new Error('Não foi possível processar a resposta da IA. O documento pode ter muitos itens — tente enviar páginas separadamente.');
+    }
+  }
 
   if (parsed.erro) {
     throw new Error(parsed.erro);
