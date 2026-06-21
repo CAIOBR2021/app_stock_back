@@ -10,6 +10,7 @@ console.log('DATABASE_URL:', process.env.DATABASE_URL ? process.env.DATABASE_URL
 
 const { sendLowStockEmail } = require('./services/emailService');
 const { analisarNotaFiscal } = require('./services/notaFiscalService');
+const { responderPergunta } = require('./services/chatbotService');
 
 // --- CONFIGURAÇÃO INICIAL ---
 const app = express();
@@ -920,6 +921,26 @@ app.post('/api/nota-fiscal/ler', async (req, res) => {
   try {
     const resultado = await analisarNotaFiscal(imageBase64, mimeType);
     res.json(resultado);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- CHATBOT IA ---
+app.post('/api/chat', async (req, res) => {
+  const { pergunta } = req.body;
+  if (!pergunta || !pergunta.trim()) {
+    return res.status(400).json({ error: 'Pergunta é obrigatória.' });
+  }
+
+  try {
+    const { rows: produtos } = await pool.query('SELECT * FROM produtos');
+    const { rows: movimentacoes } = await pool.query(
+      'SELECT * FROM movimentacoes ORDER BY criadoem DESC LIMIT 200'
+    );
+
+    const resposta = await responderPergunta(pergunta.trim(), produtos, movimentacoes);
+    res.json({ resposta });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
