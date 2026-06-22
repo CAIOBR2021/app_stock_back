@@ -11,6 +11,7 @@ console.log('DATABASE_URL:', process.env.DATABASE_URL ? process.env.DATABASE_URL
 const { sendLowStockEmail } = require('./services/emailService');
 const { analisarNotaFiscal } = require('./services/notaFiscalService');
 const { responderPergunta } = require('./services/chatbotService');
+const { classificarMaterial } = require('./services/classificacaoService');
 
 // --- CONFIGURAÇÃO INICIAL ---
 const app = express();
@@ -927,6 +928,20 @@ app.post('/api/nota-fiscal/ler', async (req, res) => {
 
   try {
     const resultado = await analisarNotaFiscal(imageBase64, mimeType);
+    res.json(resultado);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- CLASSIFICAÇÃO AUTOMÁTICA DE MATERIAL ---
+app.post('/api/classificar', async (req, res) => {
+  const { nome } = req.body;
+  if (!nome || !nome.trim()) {
+    return res.status(400).json({ error: 'Nome do material é obrigatório.' });
+  }
+  try {
+    const resultado = await classificarMaterial(nome.trim());
     res.json(resultado);
   } catch (err) {
     res.status(500).json({ error: err.message });
