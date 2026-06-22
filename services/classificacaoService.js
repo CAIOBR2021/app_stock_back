@@ -13,7 +13,7 @@ async function classificarMaterial(nome) {
   if (!apiKey) throw new Error('GEMINI_API_KEY não configurada.');
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -24,14 +24,26 @@ async function classificarMaterial(nome) {
     },
   );
 
-  if (!res.ok) throw new Error(`Gemini API error: ${res.status}`);
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error(errBody?.error?.message || `Erro na API Gemini (${res.status})`);
+  }
 
   const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-  if (!text) throw new Error('Resposta vazia do Gemini.');
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!parts || parts.length === 0) throw new Error('Resposta vazia do Gemini.');
+
+  const textPart = parts.find(p => p.text && !p.thought) || parts[parts.length - 1];
+  const text = textPart?.text?.trim();
+  if (!text) throw new Error('Resposta sem texto do Gemini.');
 
   const cleaned = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-  return JSON.parse(cleaned);
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error(`JSON inválido do Gemini: ${cleaned.substring(0, 100)}`);
+  }
 }
 
 module.exports = { classificarMaterial };
