@@ -19,7 +19,7 @@ async function classificarMaterial(nome) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: `${PROMPT}\n\nItem: "${nome}"` }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 150 },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } },
       }),
     },
   );
