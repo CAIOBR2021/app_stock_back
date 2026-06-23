@@ -140,6 +140,13 @@ async function updateSchema() {
 }
 
 // --- UTILITARIOS ---
+class BusinessError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'BusinessError';
+  }
+}
+
 const uid = () => crypto.randomUUID();
 const nowISO = () => new Date().toISOString();
 
@@ -239,7 +246,7 @@ async function validarSaidaRetroativa(client, produtoId, quantidade, dataCompete
   }
 
   if (saldoNaData < Number(quantidade)) {
-    throw new Error(
+    throw new BusinessError(
       `Saldo insuficiente na data ${dataCompetencia}. ` +
       `Disponivel naquela data: ${saldoNaData} — Solicitado: ${quantidade}`
     );
@@ -391,25 +398,23 @@ app.post('/api/movimentacoes', async (req, res) => {
     
     const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
     const produto = prodRes.rows[0];
-    if (!produto) throw new Error('Produto nao encontrado');
+    if (!produto) throw new BusinessError('Produto não encontrado.');
 
     const dataCompetenciaFinal = dataCompetencia || hojeISO();
     const hoje = hojeISO();
     const isRetroativa = dataCompetenciaFinal < hoje;
 
-    // CORREÇÃO 2: Impedir o ajuste ou saldo inicial com data no passado
     if ((tipo === 'ajuste' || tipo === 'saldo_inicial') && isRetroativa) {
-      throw new Error(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo. Ele deve refletir a contagem física atual.`);
+      throw new BusinessError(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo. Ele deve refletir a contagem física atual.`);
     }
 
-    // ── CORREÇÃO: saídas usam saldo atual para hoje, histórico só para datas passadas ──
     if (tipo === 'saida') {
       if (isRetroativa) {
         await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
       } else {
         if (Number(produto.quantidade) < Number(quantidade)) {
-          throw new Error(
-            `Estoque insuficiente. Disponivel: ${produto.quantidade} — Solicitado: ${quantidade}`
+          throw new BusinessError(
+            `Estoque insuficiente. Disponível: ${produto.quantidade} — Solicitado: ${quantidade}`
           );
         }
       }
@@ -488,7 +493,8 @@ app.post('/api/movimentacoes', async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -513,7 +519,7 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
     const isRetroativa = dataCompetenciaFinal < hoje;
 
     if ((tipo === 'ajuste' || tipo === 'saldo_inicial') && isRetroativa) {
-      throw new Error(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo.`);
+      throw new BusinessError(`Não é permitido lançar ${tipo === 'ajuste' ? 'Ajuste de Estoque' : 'Saldo Inicial'} retroativo.`);
     }
 
     const produtoIds = itens.map(i => i.produtoId);
@@ -528,13 +534,13 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
       const { produtoId, quantidade, valorUnitario } = item;
 
       const produto = produtoMap.get(produtoId);
-      if (!produto) throw new Error(`Produto ${produtoId} não encontrado.`);
+      if (!produto) throw new BusinessError(`Produto não encontrado.`);
 
       if (tipo === 'saida') {
         if (isRetroativa) {
           await validarSaidaRetroativa(client, produtoId, quantidade, dataCompetenciaFinal);
         } else if (Number(produto.quantidade) < Number(quantidade)) {
-          throw new Error(
+          throw new BusinessError(
             `Estoque insuficiente para "${produto.nome}". Disponível: ${produto.quantidade} — Solicitado: ${quantidade}`
           );
         }
@@ -597,7 +603,8 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
     res.status(201).json({ sucesso: true, total: resultados.length, resultados });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -609,11 +616,11 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     const movResult = await client.query('SELECT * FROM movimentacoes WHERE id = $1', [id]);
-    if (movResult.rowCount === 0) throw new Error('Movimentacao nao encontrada.');
-    
+    if (movResult.rowCount === 0) throw new BusinessError('Movimentação não encontrada.');
+
     const mov = movResult.rows[0];
     if (mov.tipo === 'ajuste' || mov.tipo === 'saldo_inicial') {
-      throw new Error(`Não é possível excluir ${mov.tipo === 'ajuste' ? 'um ajuste' : 'um saldo inicial'}.`);
+      throw new BusinessError(`Não é possível excluir ${mov.tipo === 'ajuste' ? 'um ajuste' : 'um saldo inicial'}.`);
     }
 
     if (mov.entrega_id) {
@@ -633,7 +640,8 @@ app.delete('/api/movimentacoes/:id', async (req, res) => {
     res.status(200).json({ produtoAtualizado: toCamelCase({ ...produto, quantidade: novaQtd }) });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -648,11 +656,11 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
     await client.query('BEGIN');
 
     const movRes = await client.query('SELECT * FROM movimentacoes WHERE id = $1', [id]);
-    if (movRes.rowCount === 0) throw new Error('Movimentacao nao encontrada');
+    if (movRes.rowCount === 0) throw new BusinessError('Movimentação não encontrada.');
     const movAntiga = movRes.rows[0];
 
     if (movAntiga.tipo === 'ajuste' || movAntiga.tipo === 'saldo_inicial') {
-      throw new Error('Use um novo Ajuste ou Entrada/Saída para corrigir o saldo atual.');
+      throw new BusinessError('Use um novo Ajuste ou Entrada/Saída para corrigir o saldo atual.');
     }
 
     const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [movAntiga.produtoid]);
@@ -668,7 +676,7 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
     if (movAntiga.tipo === 'entrada') novoSaldoFinal += novaQtd;
     else if (movAntiga.tipo === 'saida') novoSaldoFinal -= novaQtd;
 
-    if (novoSaldoFinal < 0) throw new Error('Estoque ficaria negativo com essa alteracao.');
+    if (novoSaldoFinal < 0) throw new BusinessError('Estoque ficaria negativo com essa alteração.');
 
     await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldoFinal, produto.id]);
     
@@ -694,7 +702,8 @@ app.patch('/api/movimentacoes/:id', async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -741,8 +750,8 @@ app.post('/api/entregas', async (req, res) => {
     const prodRes = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [produtoId]);
     const produto = prodRes.rows[0];
     
-    if (!produto) throw new Error('Produto nao encontrado.');
-    if (Number(produto.quantidade) < quantidadeNum) throw new Error(`Estoque insuficiente (${produto.quantidade} disponivel).`);
+    if (!produto) throw new BusinessError('Produto não encontrado.');
+    if (Number(produto.quantidade) < quantidadeNum) throw new BusinessError(`Estoque insuficiente (${produto.quantidade} disponível).`);
 
     const entregaId = uid();
     await client.query(
@@ -771,7 +780,8 @@ app.post('/api/entregas', async (req, res) => {
     res.status(201).json({ success: true });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -790,7 +800,7 @@ app.put('/api/entregas/:id', async (req, res) => {
     await client.query('BEGIN');
 
     const resAntiga = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
-    if (resAntiga.rowCount === 0) throw new Error('Entrega nao encontrada');
+    if (resAntiga.rowCount === 0) throw new BusinessError('Entrega não encontrada.');
     const entregaAntiga = resAntiga.rows[0];
 
     const velhoProdutoId = entregaAntiga.produto_id;
@@ -806,8 +816,8 @@ app.put('/api/entregas/:id', async (req, res) => {
 
       const resProdNovo = await client.query('SELECT * FROM produtos WHERE id = $1 FOR UPDATE', [novoProdutoId]);
       const prodNovo = resProdNovo.rows[0];
-      if (!prodNovo) throw new Error('Novo produto selecionado nao encontrado.');
-      if (Number(prodNovo.quantidade) < novaQuantidade) throw new Error(`Estoque insuficiente (${prodNovo.quantidade} disponivel).`);
+      if (!prodNovo) throw new BusinessError('Novo produto selecionado não encontrado.');
+      if (Number(prodNovo.quantidade) < novaQuantidade) throw new BusinessError(`Estoque insuficiente (${prodNovo.quantidade} disponível).`);
 
       const novoSaldo = Number(prodNovo.quantidade) - novaQuantidade;
       await client.query('UPDATE produtos SET quantidade = $1, atualizadoem = NOW() WHERE id = $2', [novoSaldo, novoProdutoId]);
@@ -845,7 +855,8 @@ app.put('/api/entregas/:id', async (req, res) => {
     res.json(toCamelCase(rows[0]));
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -881,7 +892,7 @@ app.delete('/api/entregas/:id', async (req, res) => {
     await client.query('BEGIN');
 
     const resEntrega = await client.query('SELECT * FROM entregas WHERE id = $1', [id]);
-    if (resEntrega.rowCount === 0) throw new Error('Entrega nao encontrada.');
+    if (resEntrega.rowCount === 0) throw new BusinessError('Entrega não encontrada.');
     const entrega = resEntrega.rows[0];
     const quantidadeEstorno = Number(entrega.item_quantidade);
 
@@ -903,7 +914,8 @@ app.delete('/api/entregas/:id', async (req, res) => {
     res.json({ success: true, message: 'Entrega excluida e estoque estornado.' });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    const status = err instanceof BusinessError ? 400 : 500;
+    res.status(status).json({ error: err.message });
   } finally {
     client.release();
   }
