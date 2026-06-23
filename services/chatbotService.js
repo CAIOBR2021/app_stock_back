@@ -20,7 +20,7 @@ function buildChatPrompt(pergunta, produtos, movimentacoes) {
       prodMap.get(m.produtoid) ?? '?',
       m.tipo,
       m.quantidade,
-      String(m.datacompetencia || m.criadoem || '').substring(0, 10),
+      ((d) => d instanceof Date ? d.toISOString().substring(0, 10) : String(d || '').substring(0, 10))(m.datacompetencia || m.criadoem),
       m.motivo ?? '-',
     ];
     return campos.join('|');
