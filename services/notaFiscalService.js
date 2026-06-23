@@ -52,7 +52,7 @@ async function analisarNotaFiscal(imageBase64, mimeType) {
             { inline_data: { mime_type: mimeType || 'image/jpeg', data: imageBase64 } },
           ],
         }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 65536 },
+        generationConfig: { temperature: 0.1, maxOutputTokens: 8192, thinkingConfig: { thinkingBudget: 0 } },
       }),
     },
   );

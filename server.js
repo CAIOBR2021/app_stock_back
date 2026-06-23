@@ -956,9 +956,11 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    const { rows: produtos } = await pool.query('SELECT * FROM produtos');
+    const { rows: produtos } = await pool.query(
+      'SELECT id, nome, quantidade, unidade, estoqueminimo, categoria, localarmazenamento, valorunitario FROM produtos'
+    );
     const { rows: movimentacoes } = await pool.query(
-      'SELECT * FROM movimentacoes ORDER BY criadoem DESC LIMIT 200'
+      'SELECT produtoid, tipo, quantidade, motivo, data_competencia AS datacompetencia, criadoem FROM movimentacoes ORDER BY criadoem DESC LIMIT 50'
     );
 
     const resposta = await responderPergunta(pergunta.trim(), produtos, movimentacoes);
