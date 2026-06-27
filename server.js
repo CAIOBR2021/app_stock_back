@@ -80,6 +80,7 @@ async function setupDatabase() {
       nome_obra TEXT,
       ordem_compra TEXT,
       custo_unitario_historico NUMERIC(10, 2),
+      operador_nome TEXT,
       FOREIGN KEY (produtoid) REFERENCES produtos (id) ON DELETE CASCADE,
       FOREIGN KEY (entrega_id) REFERENCES entregas (id) ON DELETE CASCADE
     );
@@ -108,8 +109,11 @@ async function updateSchema() {
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='ordem_compra') THEN 
           ALTER TABLE movimentacoes ADD COLUMN ordem_compra TEXT; 
         END IF; 
-        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN 
-          ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2); 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='custo_unitario_historico') THEN
+          ALTER TABLE movimentacoes ADD COLUMN custo_unitario_historico NUMERIC(10, 2);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='operador_nome') THEN
+          ALTER TABLE movimentacoes ADD COLUMN operador_nome TEXT;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='movimentacoes' AND column_name='data_competencia') THEN
           ALTER TABLE movimentacoes ADD COLUMN data_competencia DATE;
@@ -388,7 +392,7 @@ app.post('/api/movimentacoes', async (req, res) => {
   const {
     produtoId, tipo, quantidade, motivo,
     custoEntrada, nomeObra, ordemCompra, custoUnitarioHistorico,
-    dataCompetencia
+    dataCompetencia, operadorNome
   } = req.body;
 
   const client = await pool.connect();
@@ -456,16 +460,17 @@ app.post('/api/movimentacoes', async (req, res) => {
     
     const movId = uid();
     await client.query(
-      `INSERT INTO movimentacoes 
+      `INSERT INTO movimentacoes
          (id, produtoid, tipo, quantidade, motivo, criadoem,
-          data_competencia, nome_obra, ordem_compra, custo_unitario_historico) 
-       VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)`,
+          data_competencia, nome_obra, ordem_compra, custo_unitario_historico, operador_nome)
+       VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10)`,
       [
         movId, produtoId, tipo, Number(quantidade), motivo,
         dataCompetenciaFinal,
         nomeObra || null,
         ordemCompra || null,
-        custoUnitarioHistorico !== undefined ? Number(custoUnitarioHistorico) : null
+        custoUnitarioHistorico !== undefined ? Number(custoUnitarioHistorico) : null,
+        operadorNome || null
       ]
     );
 
@@ -487,7 +492,8 @@ app.post('/api/movimentacoes', async (req, res) => {
         data_competencia: dataCompetenciaFinal,
         nome_obra: nomeObra,
         ordem_compra: ordemCompra,
-        custo_unitario_historico: custoUnitarioHistorico
+        custo_unitario_historico: custoUnitarioHistorico,
+        operador_nome: operadorNome
       }),
       produto: toCamelCase(updatedProd.rows[0]) 
     });
@@ -502,7 +508,7 @@ app.post('/api/movimentacoes', async (req, res) => {
 
 // --- ROTA DE MOVIMENTAÇÕES EM LOTE ---
 app.post('/api/movimentacoes/lote', async (req, res) => {
-  const { itens, tipo, motivo, nomeObra, ordemCompra, dataCompetencia } = req.body;
+  const { itens, tipo, motivo, nomeObra, ordemCompra, dataCompetencia, operadorNome } = req.body;
 
   if (!Array.isArray(itens) || itens.length === 0) {
     return res.status(400).json({ error: 'Lista de itens é obrigatória.' });
@@ -581,14 +587,15 @@ app.post('/api/movimentacoes/lote', async (req, res) => {
       await client.query(
         `INSERT INTO movimentacoes
            (id, produtoid, tipo, quantidade, motivo, criadoem,
-            data_competencia, nome_obra, ordem_compra, custo_unitario_historico)
-         VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)`,
+            data_competencia, nome_obra, ordem_compra, custo_unitario_historico, operador_nome)
+         VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10)`,
         [
           movId, produtoId, tipo, Number(quantidade), motivo,
           dataCompetenciaFinal,
           nomeObra || null,
           ordemCompra || null,
-          valorUnitario !== undefined ? Number(valorUnitario) : null
+          valorUnitario !== undefined ? Number(valorUnitario) : null,
+          operadorNome || null
         ]
       );
 
