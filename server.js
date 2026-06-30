@@ -298,7 +298,7 @@ app.get('/api/produtos', async (req, res) => {
 });
 
 app.post('/api/produtos', async (req, res) => {
-  const { nome, descricao, categoria, unidade, quantidade, estoqueMinimo, localArmazenamento, fornecedor, valorUnitario, conversoes } = req.body;
+  const { nome, descricao, categoria, unidade, quantidade, estoqueMinimo, localArmazenamento, fornecedor, valorUnitario, conversoes, operadorNome } = req.body;
   const id = uid();
   const sku = `PROD-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
 
@@ -313,10 +313,10 @@ app.post('/api/produtos', async (req, res) => {
     const qtdInicial = Number(quantidade) || 0;
     if (qtdInicial > 0) {
       await pool.query(
-        `INSERT INTO movimentacoes 
-           (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia) 
-         VALUES ($1, $2, 'saldo_inicial', $3, 'Saldo inicial na criação do produto', NOW(), $4)`,
-        [uid(), id, qtdInicial, hojeISO()]
+        `INSERT INTO movimentacoes
+           (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, operador_nome)
+         VALUES ($1, $2, 'saldo_inicial', $3, 'Saldo inicial na criação do produto', NOW(), $4, $5)`,
+        [uid(), id, qtdInicial, hojeISO(), operadorNome || null]
       );
     }
 
@@ -742,9 +742,9 @@ app.get('/api/entregas', async (req, res) => {
 });
 
 app.post('/api/entregas', async (req, res) => {
-  const { 
+  const {
     dataHoraSolicitacao, localArmazenagem, localObra, produtoId,
-    itemQuantidade, responsavelNome, responsavelTelefone 
+    itemQuantidade, responsavelNome, responsavelTelefone, operadorNome
   } = req.body;
 
   const quantidadeNum = Number(itemQuantidade);
@@ -774,9 +774,9 @@ app.post('/api/entregas', async (req, res) => {
     const dataFutura = dataHoraSolicitacao.split('T')[0];
 
     await client.query(
-      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, entrega_id, nome_obra)
-       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6, $7)`,
-      [uid(), produtoId, quantidadeNum, `Entrega Agendada: ${localObra}`, dataFutura, entregaId, localObra]
+      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, entrega_id, nome_obra, operador_nome)
+       VALUES ($1, $2, 'saida', $3, $4, NOW(), $5, $6, $7, $8)`,
+      [uid(), produtoId, quantidadeNum, `Entrega Agendada: ${localObra}`, dataFutura, entregaId, localObra, operadorNome || null]
     );
 
     if (produto.estoqueminimo !== null && novoSaldo <= produto.estoqueminimo) {
@@ -893,6 +893,7 @@ app.patch('/api/entregas/status/lote', async (req, res) => {
 
 app.delete('/api/entregas/:id', async (req, res) => {
   const { id } = req.params;
+  const { operadorNome } = req.body || {};
   const client = await pool.connect();
   
   try {
@@ -910,9 +911,9 @@ app.delete('/api/entregas/:id', async (req, res) => {
 
     const motivoEstorno = `Estorno: Entrega excluida (Obra: ${entrega.local_obra})`;
     await client.query(
-      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia)
-       VALUES ($1, $2, 'entrada', $3, $4, NOW(), $5)`,
-      [uid(), entrega.produto_id, quantidadeEstorno, motivoEstorno, hojeISO()]
+      `INSERT INTO movimentacoes (id, produtoid, tipo, quantidade, motivo, criadoem, data_competencia, operador_nome)
+       VALUES ($1, $2, 'entrada', $3, $4, NOW(), $5, $6)`,
+      [uid(), entrega.produto_id, quantidadeEstorno, motivoEstorno, hojeISO(), operadorNome || null]
     );
 
     await client.query('DELETE FROM entregas WHERE id = $1', [id]);
